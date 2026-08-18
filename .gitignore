@@ -1,0 +1,6 @@
+.DS_Store
+build/
+config.json
+QuickToggle.diff
+Assets/QuickToggleIcon-v1*
+Assets/QuickToggleIcon-0817v2.iconset/
