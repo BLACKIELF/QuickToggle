@@ -487,8 +487,12 @@ private enum LaunchPolicy {
 }
 
 private enum RevealPolicy {
-    static func shouldReopen(windowCount: Int, targetIsFrontmost: Bool = false) -> Bool {
-        !targetIsFrontmost && windowCount == 0
+    static func shouldHideImmediately(targetIsFrontmost: Bool) -> Bool {
+        targetIsFrontmost
+    }
+
+    static func shouldReopen(windowCount: Int) -> Bool {
+        windowCount == 0
     }
 }
 
@@ -571,6 +575,15 @@ private final class ToggleEngine {
             return
         }
 
+        if RevealPolicy.shouldHideImmediately(targetIsFrontmost: running.isActive) {
+            guard running.hide() else {
+                onStatus?("无法隐藏目标应用。")
+                return
+            }
+            onStatus?("\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。")
+            return
+        }
+
         if Accessibility.isTrusted {
             let windows = Accessibility.windows(for: running.processIdentifier)
             if RevealPolicy.shouldReopen(windowCount: windows.count) {
@@ -620,13 +633,8 @@ private final class ToggleEngine {
             return (bounds["Width"] ?? 0) > 64 && (bounds["Height"] ?? 0) > 64
         }.count
         guard RevealPolicy.shouldReopen(
-            windowCount: existingWindowCount,
-            targetIsFrontmost: running.isActive
+            windowCount: existingWindowCount
         ) else {
-            guard !running.isActive else {
-                onStatus?("\(target.name) 已在前台，没有重复打开窗口。")
-                return
-            }
             guard running.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
                 onStatus?("无法激活目标应用。")
                 return
@@ -2134,14 +2142,14 @@ private enum SelfTest {
     }
 
     private static func checkRevealPolicy(_ failures: inout [String]) {
+        if !RevealPolicy.shouldHideImmediately(targetIsFrontmost: true) {
+            failures.append("frontmost app was not hidden immediately")
+        }
         if !RevealPolicy.shouldReopen(windowCount: 0) {
             failures.append("windowless running app did not use application reopen")
         }
         if RevealPolicy.shouldReopen(windowCount: 1) {
             failures.append("visible app was reopened unnecessarily")
-        }
-        if RevealPolicy.shouldReopen(windowCount: 0, targetIsFrontmost: true) {
-            failures.append("frontmost app was reopened unnecessarily")
         }
     }
 

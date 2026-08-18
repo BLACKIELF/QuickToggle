@@ -2,12 +2,12 @@
 
 轻量、原生的 macOS 菜单栏应用切换工具。为常用 App 设置全局快捷键：按一下呼出，再按一次安全恢复。
 
-当前版本：`0.0.1`
+当前版本：`0.0.2`
 
 ## 下载与运行
 
 - Apple Silicon Mac，macOS 13 或更高版本。
-- 可从 [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest) 下载 `QuickToggle-0.0.1-macOS-arm64.zip`。
+- 可从 [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest) 下载 `QuickToggle-0.0.2-macOS-arm64.zip`。
 - 当前版本使用 ad-hoc 签名，未经 Apple 公证，不会自动安装到 `/Applications`。首次运行若被 Gatekeeper 拦截，请在“系统设置 > 隐私与安全性”中确认打开；不放心时请直接从源码构建。
 
 从源码构建需要 Xcode Command Line Tools：
@@ -41,6 +41,7 @@ open "build/QuickToggle.app"
 ## 两次按键行为
 
 - 原本隐藏：第一次呼出；第二次重新隐藏。
+- 目标已经在前台：按快捷键会直接安全隐藏，不关闭任何窗口。
 - 原本全部窗口最小化：有辅助功能权限时只恢复一个窗口；第二次只重新最小化该窗口。
 - 原本已显示：第一次激活；第二次不关闭窗口，只恢复之前的前台应用。
 - 两次按键之间若用户切换了应用、目标进程重启或窗口状态改变，本次不做破坏性恢复。
@@ -86,12 +87,12 @@ QuickToggle 不联网、不上传数据、不包含遥测。应用选择、快�
 
 QuickToggle is a lightweight, native macOS menu-bar utility for assigning global shortcuts to apps. Press once to reveal an app; press again to safely restore the previous state.
 
-Current version: `0.0.1`
+Current version: `0.0.2`
 
 ### Download and run
 
 - Apple Silicon Mac with macOS 13 or later.
-- Download `QuickToggle-0.0.1-macOS-arm64.zip` from [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest).
+- Download `QuickToggle-0.0.2-macOS-arm64.zip` from [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest).
 - The current build is ad-hoc signed and not Apple-notarized. It is not installed into `/Applications` automatically. If Gatekeeper blocks the first launch, explicitly allow it in System Settings > Privacy & Security, or build from source.
 
 Building from source requires Xcode Command Line Tools:
@@ -113,6 +114,7 @@ open "build/QuickToggle.app"
 ### How it behaves
 
 - Hidden app: reveal it, then hide it again.
+- Frontmost app: hide it safely without closing any window.
 - Fully minimized app: with Accessibility permission, restore one window and minimize only that window again.
 - Visible app: activate it, then return focus to the previous app without closing windows.
 - If the user changes state between presses, QuickToggle avoids destructive restoration.
