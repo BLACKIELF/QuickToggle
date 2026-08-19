@@ -380,6 +380,25 @@ private enum VerifiedLaunchHotKeys {
     }
 }
 
+private func sizedApplicationIcon(at path: String, pointSize: CGFloat) -> NSImage {
+    let source = NSWorkspace.shared.icon(forFile: path)
+    let canvas = NSSize(width: pointSize, height: pointSize)
+    let output = NSImage(size: canvas)
+    output.lockFocus()
+    NSGraphicsContext.current?.imageInterpolation = .high
+    source.draw(
+        in: NSRect(origin: .zero, size: canvas),
+        from: .zero,
+        operation: .sourceOver,
+        fraction: 1,
+        respectFlipped: true,
+        hints: [.interpolation: NSImageInterpolation.high]
+    )
+    output.unlockFocus()
+    output.isTemplate = false
+    return output
+}
+
 private enum BindingHelpContent {
     static func view(for binding: AppBinding) -> NSView {
         let stack = NSStackView()
@@ -602,9 +621,7 @@ private final class PendingApplicationPickerController: NSViewController, NSSear
         let identifier = NSUserInterfaceItemIdentifier("PendingAppCell")
         let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
             ?? makeCell(identifier: identifier)
-        let icon = NSWorkspace.shared.icon(forFile: item.path)
-        icon.size = NSSize(width: 18, height: 18)
-        cell.imageView?.image = icon
+        cell.imageView?.image = sizedApplicationIcon(at: item.path, pointSize: 20)
         cell.textField?.stringValue = item.name
         cell.setAccessibilityLabel(item.name)
         return cell
@@ -658,8 +675,8 @@ private final class PendingApplicationPickerController: NSViewController, NSSear
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
             icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 18),
-            icon.heightAnchor.constraint(equalToConstant: 18),
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            icon.heightAnchor.constraint(equalToConstant: 20),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
             label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
@@ -1991,7 +2008,7 @@ private final class SettingsController: NSObject {
         bindingsStack.alignment = .leading
         bindingsStack.distribution = .fill
         bindingsStack.spacing = 6
-        bindingsStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+        bindingsStack.edgeInsets = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
         listScroll.documentView = bindingsStack
         listScroll.hasVerticalScroller = true
         listScroll.autohidesScrollers = true
@@ -2020,10 +2037,10 @@ private final class SettingsController: NSObject {
         permissionIcon.image = NSImage(
             systemSymbolName: "lock.shield",
             accessibilityDescription: "窗口恢复能力"
-        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .medium))
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium))
         permissionIcon.contentTintColor = colorTheme.primary
-        permissionIcon.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        permissionIcon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        permissionIcon.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        permissionIcon.heightAnchor.constraint(equalToConstant: 20).isActive = true
 
         permissionStatus.font = .systemFont(ofSize: 11.5)
         permissionStatus.textColor = .secondaryLabelColor
@@ -2224,16 +2241,14 @@ private final class SettingsController: NSObject {
         row.borderWidth = 1
         row.borderColor = .separatorColor.withAlphaComponent(0.45)
         row.fillColor = .controlBackgroundColor.withAlphaComponent(0.34)
-        row.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 56).isActive = true
         row.setAccessibilityLabel("\(binding.target.name) 快捷键设置")
 
         let icon = NSImageView()
-        let image = NSWorkspace.shared.icon(forFile: binding.target.path)
-        image.size = NSSize(width: 28, height: 28)
-        icon.image = image
+        icon.image = sizedApplicationIcon(at: binding.target.path, pointSize: 32)
         icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 32).isActive = true
         icon.setAccessibilityLabel("\(binding.target.name) 图标")
 
         let name = NSTextField(labelWithString: binding.target.name)
@@ -2280,29 +2295,33 @@ private final class SettingsController: NSObject {
         helpButton.image = NSImage(
             systemSymbolName: "questionmark.circle",
             accessibilityDescription: "说明"
-        )
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
         helpButton.bezelStyle = .inline
         helpButton.isBordered = false
         helpButton.contentTintColor = .secondaryLabelColor
         helpButton.target = self
         helpButton.action = #selector(showBindingHelp(_:))
         helpButton.identifier = NSUserInterfaceItemIdentifier(binding.id.uuidString)
-        helpButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        helpButton.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        helpButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        helpButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         helpButton.setAccessibilityLabel("\(binding.target.name) 的快捷键说明")
         helpButton.setAccessibilityHelp("查看轻唤热键、已确认的应用快捷键，以及如何自行查看。")
         helpButton.setAccessibilityRole(.button)
         helpButton.toolTip = "查看这个应用的快捷键说明"
 
         let deleteButton = NSButton()
-        deleteButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "删除")
+        deleteButton.image = NSImage(
+            systemSymbolName: "trash",
+            accessibilityDescription: "删除"
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
         deleteButton.bezelStyle = .inline
+        deleteButton.isBordered = false
         deleteButton.contentTintColor = .secondaryLabelColor
         deleteButton.target = self
         deleteButton.action = #selector(deleteBinding(_:))
         deleteButton.identifier = NSUserInterfaceItemIdentifier(binding.id.uuidString)
-        deleteButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        deleteButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        deleteButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        deleteButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         deleteButton.setAccessibilityLabel("移除 \(binding.target.name)")
 
         let rowStack = horizontalStack([icon, labels, spacer, recorder, helpButton, deleteButton], spacing: 10)
@@ -2310,7 +2329,7 @@ private final class SettingsController: NSObject {
         pin(
             rowStack,
             inside: row.contentView ?? row,
-            insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 8)
+            insets: NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 10)
         )
         return row
     }
@@ -2318,10 +2337,11 @@ private final class SettingsController: NSObject {
     private func makeSystemShortcutItem(_ item: (String, String, String)) -> NSView {
         let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: item.0, accessibilityDescription: item.1)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium))
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .medium))
         icon.contentTintColor = colorTheme.primary
         guideAccentIcons.append(icon)
-        icon.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 20).isActive = true
 
         let title = NSTextField(labelWithString: item.1)
         title.font = .systemFont(ofSize: 12.5, weight: .medium)
@@ -2348,12 +2368,10 @@ private final class SettingsController: NSObject {
         ) else { return nil }
 
         let icon = NSImageView()
-        let image = NSWorkspace.shared.icon(forFile: applicationURL.path)
-        image.size = NSSize(width: 34, height: 34)
-        icon.image = image
+        icon.image = sizedApplicationIcon(at: applicationURL.path, pointSize: 28)
         icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.widthAnchor.constraint(equalToConstant: 34).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
         icon.setAccessibilityLabel("\(name) 图标")
 
         let appName = NSTextField(labelWithString: name)
@@ -2377,7 +2395,7 @@ private final class SettingsController: NSObject {
         tips.distribution = .fillEqually
         let row = horizontalStack([icon, appName, tips], spacing: 10)
         row.alignment = .centerY
-        row.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 40).isActive = true
         return row
     }
 
