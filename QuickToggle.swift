@@ -1069,14 +1069,20 @@ private final class ShortcutRecorderButton: NSButton {
     override var acceptsFirstResponder: Bool { true }
     deinit { removeMonitor() }
 
+    static func shouldCapture(isRecording: Bool, windowIsKey: Bool) -> Bool {
+        isRecording && windowIsKey
+    }
+
     @objc private func beginRecording() {
         guard let window, window.makeFirstResponder(self) else { return }
         isRecording = true
         title = "请按组合键…"
         removeMonitor()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.isRecording,
-                  self.window?.firstResponder === self else { return event }
+            guard let self, Self.shouldCapture(
+                isRecording: self.isRecording,
+                windowIsKey: self.window?.isKeyWindow == true
+            ) else { return event }
             self.handle(event)
             return nil
         }
@@ -2010,6 +2016,7 @@ private enum SelfTest {
         checkRevealPolicy(&failures)
         checkHotKeyRouting(&failures)
         checkMultiBindingPreferences(&failures)
+        checkRecorderGate(&failures)
 
         if failures.isEmpty {
             print("QuickToggle self-test passed")
@@ -2171,6 +2178,15 @@ private enum SelfTest {
         }
         if HotKeyManager.routes(eventSignature: first.routingSignature, to: second.routingSignature) {
             failures.append("hot key event leaked to another manager")
+        }
+    }
+
+    private static func checkRecorderGate(_ failures: inout [String]) {
+        if !ShortcutRecorderButton.shouldCapture(isRecording: true, windowIsKey: true) {
+            failures.append("key window recording was rejected")
+        }
+        if ShortcutRecorderButton.shouldCapture(isRecording: true, windowIsKey: false) {
+            failures.append("background window captured a shortcut")
         }
     }
 
