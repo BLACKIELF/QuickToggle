@@ -766,6 +766,15 @@ private final class HotKeyManager {
         return .success(())
     }
 
+    func rebind(_ shortcut: Shortcut) -> Result<Void, HotKeyFailure> {
+        if let reference {
+            _ = UnregisterEventHotKey(reference)
+            self.reference = nil
+        }
+        activeShortcut = nil
+        return replace(with: shortcut)
+    }
+
     func close() {
         _ = disable()
         if let handler { RemoveEventHandler(handler) }
@@ -1479,6 +1488,19 @@ private final class QuickToggleModel {
         settingsHotKey.close()
     }
 
+    func recoverHotKeys() {
+        guard preferences != nil else { return }
+        var failed = 0
+        if case .failure = settingsHotKey.rebind(settingsShortcut) { failed += 1 }
+        if isEnabled {
+            failed += rebindAll().failed
+        }
+        if failed > 0 {
+            statusMessage = "快捷键注册已失效，已尝试恢复；仍有 \(failed) 个未成功。"
+            onChange?()
+        }
+    }
+
     private func saveBindings() {
         preferences?.saveBindings(bindings)
     }
@@ -1508,6 +1530,19 @@ private final class QuickToggleModel {
         for binding in bindings {
             guard let shortcut = binding.shortcut else { continue }
             switch hotKeyManager(for: binding.id).replace(with: shortcut) {
+            case .success: active += 1
+            case .failure: failed += 1
+            }
+        }
+        return (active, failed)
+    }
+
+    private func rebindAll() -> (active: Int, failed: Int) {
+        var active = 0
+        var failed = 0
+        for binding in bindings {
+            guard let shortcut = binding.shortcut else { continue }
+            switch hotKeyManager(for: binding.id).rebind(shortcut) {
             case .success: active += 1
             case .failure: failed += 1
             }
@@ -2422,24 +2457,29 @@ private enum LaunchMode {
     case idleMeasure
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let mode: LaunchMode
     private let model: QuickToggleModel
     private var statusItem: NSStatusItem?
     private var settings: SettingsController?
     private var previousApplication: NSRunningApplication?
+    private var lastHotKeyRecovery = Date.distantPast
 
     init(mode: LaunchMode) {
         self.mode = mode
         model = QuickToggleModel(diagnosticMode: mode != .normal)
         super.init()
         model.onChange = { [weak self] in self?.refreshInterface() }
-        model.onSettingsHotKey = { [weak self] in self?.toggleSettings() }
+        model.onSettingsHotKey = { [weak self] in
+            self?.recoverHotKeysIfNeeded()
+            self?.toggleSettings()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installStatusItem()
+        observeWorkspaceRecovery()
 
         switch mode {
         case .normal:
@@ -2461,8 +2501,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) { refreshInterface() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        recoverHotKeysIfNeeded()
+        refreshInterface()
+    }
     func applicationWillTerminate(_ notification: Notification) { model.close() }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        recoverHotKeysIfNeeded()
+    }
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -2507,6 +2554,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         addMenuItem("申请辅助功能权限", action: #selector(requestAccessibilityAction), to: menu)
         menu.addItem(.separator())
         addMenuItem("退出", action: #selector(quitAction), key: "q", to: menu)
+        menu.delegate = self
         statusItem.menu = menu
     }
 
@@ -2547,10 +2595,72 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         previousApplication = nil
     }
 
-    @objc private func showSettingsAction() { showSettings() }
+    @objc private func showSettingsAction() {
+        recoverHotKeysIfNeeded()
+        showSettings()
+    }
     @objc private func toggleEnabledAction() { model.toggleEnabled() }
     @objc private func requestAccessibilityAction() { model.requestAccessibility() }
     @objc private func quitAction() { NSApp.terminate(nil) }
+
+    private func observeWorkspaceRecovery() {
+        guard mode == .normal else { return }
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(
+            self,
+            selector: #selector(handleWorkspaceRecovery),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        workspace.addObserver(
+            self,
+            selector: #selector(handleWorkspaceRecovery),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        workspace.addObserver(
+            self,
+            selector: #selector(handleWorkspaceRecovery),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleWorkspaceRecovery),
+            name: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
+    }
+
+    @objc private func handleWorkspaceRecovery() {
+        recoverHotKeysIfNeeded(force: true)
+    }
+
+    private func recoverHotKeysIfNeeded(force: Bool = false) {
+        guard mode == .normal else { return }
+        if relaunchIfOnDiskBuildIsNewer() { return }
+        if !force, Date().timeIntervalSince(lastHotKeyRecovery) < 2 { return }
+        lastHotKeyRecovery = Date()
+        model.recoverHotKeys()
+    }
+
+    private func relaunchIfOnDiskBuildIsNewer() -> Bool {
+        guard let launched = NSRunningApplication.current.launchDate,
+              let executable = Bundle.main.executableURL,
+              let modified = try? executable.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+              modified.timeIntervalSince(launched) > 2 else { return false }
+        let appPath = Bundle.main.bundleURL.path
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", "sleep 0.4; /usr/bin/open \"\(appPath)\""]
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        NSApp.terminate(nil)
+        return true
+    }
 }
 
 // MARK: - Runnable self-test
@@ -2565,6 +2675,7 @@ private enum SelfTest {
         checkRevealPolicy(&failures)
         checkWindowPresence(&failures)
         checkHotKeyRouting(&failures)
+        checkHotKeyRebind(&failures)
         checkMultiBindingPreferences(&failures)
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
@@ -2846,6 +2957,31 @@ private enum SelfTest {
         }
         if ShortcutRecorderButton.shouldCapture(isRecording: true, windowIsKey: false) {
             failures.append("background window captured a shortcut")
+        }
+    }
+
+    private static func checkHotKeyRebind(_ failures: inout [String]) {
+        let manager = HotKeyManager()
+        defer { manager.close() }
+        let shortcut = Shortcut(
+            keyCode: UInt32(kVK_F12),
+            modifiers: UInt32(controlKey | shiftKey),
+            label: "F12"
+        )
+        switch manager.replace(with: shortcut) {
+        case .failure(.occupied):
+            return
+        case .failure(.failed):
+            failures.append("hot key rebind setup failed")
+            return
+        case .success:
+            break
+        }
+        if case .failure = manager.rebind(shortcut) {
+            failures.append("rebinding the same hot key failed")
+        }
+        if !manager.isActive {
+            failures.append("rebound hot key was not active")
         }
     }
 
