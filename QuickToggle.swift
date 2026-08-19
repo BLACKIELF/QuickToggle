@@ -153,6 +153,7 @@ private final class PreferenceStore {
         static let settingsShortcut = "quickToggle.settingsShortcut"
         static let enabled = "quickToggle.enabled"
         static let launchIfNeeded = "quickToggle.launchIfNeeded"
+        static let importedVerifiedLaunchIDs = "quickToggle.importedVerifiedLaunchIDs"
     }
 
     private let defaults: UserDefaults
@@ -200,6 +201,11 @@ private final class PreferenceStore {
     var launchIfNeeded: Bool {
         get { defaults.object(forKey: Key.launchIfNeeded) == nil ? true : defaults.bool(forKey: Key.launchIfNeeded) }
         set { defaults.set(newValue, forKey: Key.launchIfNeeded) }
+    }
+
+    var importedVerifiedLaunchIDs: [String] {
+        get { defaults.stringArray(forKey: Key.importedVerifiedLaunchIDs) ?? [] }
+        set { defaults.set(newValue, forKey: Key.importedVerifiedLaunchIDs) }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
@@ -339,7 +345,7 @@ private enum ConfirmedAppShortcuts {
     static func entries(for bundleIdentifier: String) -> [(String, String)] {
         switch bundleIdentifier {
         case "com.tencent.xinWeChat":
-            return [("常见：呼出主窗口", "⇧⌘ W")]
+            return [("打开微信（本机已验证）", "⇧⌘W")]
         case "com.openai.codex":
             return [("命令菜单", "⌘ K"), ("新建对话", "⌘ N")]
         case "com.google.Chrome":
@@ -347,6 +353,30 @@ private enum ConfirmedAppShortcuts {
         default:
             return []
         }
+    }
+}
+
+private struct VerifiedLaunchHotKey {
+    let bundleIdentifier: String
+    let name: String
+    let shortcut: Shortcut
+}
+
+private enum VerifiedLaunchHotKeys {
+    static let all: [VerifiedLaunchHotKey] = [
+        VerifiedLaunchHotKey(
+            bundleIdentifier: "com.tencent.xinWeChat",
+            name: "微信",
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_W),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "W"
+            )
+        )
+    ]
+
+    static func shortcut(for bundleIdentifier: String) -> Shortcut? {
+        all.first { $0.bundleIdentifier == bundleIdentifier }?.shortcut
     }
 }
 
@@ -382,9 +412,16 @@ private enum BindingHelpContent {
             stack.addArrangedSubview(block)
         }
 
+        if let native = VerifiedLaunchHotKeys.shortcut(for: binding.target.bundleIdentifier) {
+            stack.addArrangedSubview(section(
+                title: "应用自带快速启动",
+                body: "本机已验证为 \(native.displayName)。轻唤改不了微信设置里的那一项；若该组合正被微信占用，点本行录制按钮改成其他组合，保存后立即由轻唤接管。"
+            ))
+        }
+
         stack.addArrangedSubview(section(
-            title: "如何查看或修改",
-            body: "打开该应用后，查看菜单栏命令或应用设置。轻唤不会读取、导入或覆盖应用自己的快捷键。"
+            title: "如何修改轻唤热键",
+            body: "点本行右侧的录制按钮，按下新组合即可。Esc 取消，Delete 清除。改完马上生效，不必退出轻唤。"
         ))
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 10))
@@ -1283,6 +1320,7 @@ private final class QuickToggleModel {
             bindings = store.loadBindings()
             isEnabled = store.enabled
             settingsShortcut = store.settingsShortcut ?? Self.defaultSettingsShortcut
+            importVerifiedLaunchApps()
         }
 
         settingsHotKey.onPress = { [weak self] in self?.onSettingsHotKey?() }
@@ -1486,6 +1524,38 @@ private final class QuickToggleModel {
     func close() {
         hotKeys.values.forEach { $0.close() }
         settingsHotKey.close()
+    }
+
+    private func importVerifiedLaunchApps() {
+        guard let preferences else { return }
+        var imported = Set(preferences.importedVerifiedLaunchIDs)
+        var added: [String] = []
+        var occupied: [String] = []
+        for item in VerifiedLaunchHotKeys.all {
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: item.bundleIdentifier)
+            guard let url, FileManager.default.fileExists(atPath: url.path) else { continue }
+            if bindings.contains(where: { $0.target.bundleIdentifier == item.bundleIdentifier }) {
+                imported.insert(item.bundleIdentifier)
+                continue
+            }
+            if imported.contains(item.bundleIdentifier) { continue }
+            guard addTarget(url: url) else { continue }
+            imported.insert(item.bundleIdentifier)
+            added.append(item.name)
+            guard let bindingID = bindings.first(where: { $0.target.bundleIdentifier == item.bundleIdentifier })?.id else {
+                continue
+            }
+            if !applyShortcut(item.shortcut, for: bindingID) {
+                occupied.append("\(item.name) \(item.shortcut.displayName)")
+            }
+        }
+        preferences.importedVerifiedLaunchIDs = Array(imported).sorted()
+        if added.isEmpty { return }
+        if occupied.isEmpty {
+            statusMessage = "已加入 \(added.joined(separator: "、"))，可在本行直接修改快捷键。"
+        } else {
+            statusMessage = "已加入 \(added.joined(separator: "、"))。\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。"
+        }
     }
 
     func recoverHotKeys() {
@@ -2200,7 +2270,11 @@ private final class SettingsController: NSObject {
         recorder.widthAnchor.constraint(equalToConstant: 108).isActive = true
         recorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
         recorder.setAccessibilityLabel("\(binding.target.name) 快捷键录制")
-        recorder.toolTip = "推荐 ⌘0–9、⌘⌥K、⌘⇧K、⌃⇧K；冲突时保留原快捷键"
+        if let native = VerifiedLaunchHotKeys.shortcut(for: binding.target.bundleIdentifier) {
+            recorder.toolTip = "应用自带 \(native.displayName)。点此改成轻唤热键，改完立即生效。"
+        } else {
+            recorder.toolTip = "推荐 ⌘0–9、⌘⌥K、⌘⇧K、⌃⇧K；冲突时保留原快捷键"
+        }
 
         let helpButton = NSButton()
         helpButton.image = NSImage(
@@ -2872,6 +2946,13 @@ private enum SelfTest {
         }
         if ConfirmedAppShortcuts.entries(for: "com.openai.codex").isEmpty {
             failures.append("confirmed Codex shortcuts were missing")
+        }
+        let wechat = VerifiedLaunchHotKeys.shortcut(for: "com.tencent.xinWeChat")
+        if wechat?.displayName != "⇧⌘W" {
+            failures.append("verified WeChat launch shortcut was missing")
+        }
+        if VerifiedLaunchHotKeys.shortcut(for: "com.unknown.madeup") != nil {
+            failures.append("unverified launch shortcut was invented")
         }
     }
 
