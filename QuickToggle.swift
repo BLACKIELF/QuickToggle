@@ -715,7 +715,10 @@ private final class ToggleEngine {
 
         switch decision {
         case .hideTarget:
-            _ = running.hide()
+            guard running.hide() else {
+                onStatus?("系统暂时无法隐藏目标应用；没有关闭任何窗口。")
+                return
+            }
             activatePrevious(session.previousProcessIdentifier)
             onStatus?("已恢复按键前状态；没有关闭任何窗口。")
         case .minimizeExactWindow:
