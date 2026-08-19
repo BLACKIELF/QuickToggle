@@ -216,6 +216,421 @@ private final class PreferenceStore {
     }
 }
 
+// MARK: - Visible app scan and confirmed shortcut help
+
+private struct ScannedApplication: Equatable {
+    let bundleIdentifier: String
+    let name: String
+    let path: String
+
+    var url: URL { URL(fileURLWithPath: path) }
+}
+
+private enum ApplicationScanner {
+    static func visibleApplications(excluding excludedBundleIDs: Set<String>) -> [ScannedApplication] {
+        var seen = excludedBundleIDs
+        var results: [ScannedApplication] = []
+        for url in candidateAppURLs() {
+            guard shouldInclude(url: url),
+                  let bundle = Bundle(url: url),
+                  let identifier = bundle.bundleIdentifier,
+                  !identifier.isEmpty,
+                  !seen.contains(identifier) else { continue }
+            seen.insert(identifier)
+            results.append(
+                ScannedApplication(
+                    bundleIdentifier: identifier,
+                    name: displayName(for: url),
+                    path: url.path
+                )
+            )
+        }
+        return results.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func shouldInclude(url: URL) -> Bool {
+        guard url.pathExtension == "app",
+              !isExcludedPath(url.path),
+              let bundle = Bundle(url: url),
+              let identifier = bundle.bundleIdentifier,
+              !identifier.isEmpty else { return false }
+        if identifier == Bundle.main.bundleIdentifier { return false }
+        if isInvisibleInfo(bundle.infoDictionary ?? [:]) { return false }
+        return !displayName(for: url).isEmpty
+    }
+
+    static func isExcludedPath(_ path: String) -> Bool {
+        let markers = [
+            "/Contents/Frameworks/",
+            "/Contents/PlugIns/",
+            "/XPCServices/",
+            "/Helpers/",
+            "/Library/LoginItems/"
+        ]
+        return markers.contains { path.contains($0) }
+    }
+
+    static func isInvisibleInfo(_ info: [String: Any]) -> Bool {
+        isTruthy(info["LSBackgroundOnly"]) || isTruthy(info["LSUIElement"])
+    }
+
+    static func displayName(for url: URL) -> String {
+        FileManager.default.displayName(atPath: url.path)
+            .replacingOccurrences(of: ".app", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func candidateAppURLs() -> [URL] {
+        let fileManager = FileManager.default
+        var roots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Cryptexes/App/System/Applications", isDirectory: true)
+        ]
+        if let local = fileManager.urls(for: .applicationDirectory, in: .localDomainMask).first {
+            roots.append(local)
+        }
+        var urls: [URL] = []
+        var seenPaths = Set<String>()
+        for root in roots {
+            guard let items = try? fileManager.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for item in items {
+                if item.pathExtension == "app" {
+                    appendApp(item, into: &urls, seen: &seenPaths)
+                    continue
+                }
+                guard let nested = try? fileManager.contentsOfDirectory(
+                    at: item,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for child in nested where child.pathExtension == "app" {
+                    appendApp(child, into: &urls, seen: &seenPaths)
+                }
+            }
+        }
+        return urls
+    }
+
+    private static func appendApp(_ url: URL, into urls: inout [URL], seen: inout Set<String>) {
+        let resolved = url.resolvingSymlinksInPath()
+        guard seen.insert(resolved.path).inserted else { return }
+        urls.append(resolved)
+    }
+
+    private static func isTruthy(_ value: Any?) -> Bool {
+        switch value {
+        case let flag as Bool: return flag
+        case let number as NSNumber: return number.boolValue
+        case let text as String:
+            let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized == "1" || normalized == "true" || normalized == "yes"
+        default: return false
+        }
+    }
+}
+
+private enum ConfirmedAppShortcuts {
+    static func entries(for bundleIdentifier: String) -> [(String, String)] {
+        switch bundleIdentifier {
+        case "com.tencent.xinWeChat":
+            return [("常见：呼出主窗口", "⇧⌘ W")]
+        case "com.openai.codex":
+            return [("命令菜单", "⌘ K"), ("新建对话", "⌘ N")]
+        case "com.google.Chrome":
+            return [("定位地址栏", "⌘ L"), ("重开关闭标签", "⇧⌘ T")]
+        default:
+            return []
+        }
+    }
+}
+
+private enum BindingHelpContent {
+    static func view(for binding: AppBinding) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        stack.addArrangedSubview(section(
+            title: "轻唤热键",
+            body: binding.shortcut?.displayName ?? "尚未为这个应用录制轻唤热键。"
+        ))
+
+        let confirmed = ConfirmedAppShortcuts.entries(for: binding.target.bundleIdentifier)
+        if confirmed.isEmpty {
+            stack.addArrangedSubview(section(
+                title: "已确认的应用快捷键",
+                body: "未能确认该应用的原生快捷键。请查看菜单栏命令或应用设置。"
+            ))
+        } else {
+            let rows = NSStackView()
+            rows.orientation = .vertical
+            rows.alignment = .leading
+            rows.spacing = 4
+            confirmed.forEach { rows.addArrangedSubview(keyRow(action: $0.0, keys: $0.1)) }
+            let block = NSStackView(views: [heading("已确认的应用快捷键"), rows])
+            block.orientation = .vertical
+            block.alignment = .leading
+            block.spacing = 4
+            stack.addArrangedSubview(block)
+        }
+
+        stack.addArrangedSubview(section(
+            title: "如何查看或修改",
+            body: "打开该应用后，查看菜单栏命令或应用设置。轻唤不会读取、导入或覆盖应用自己的快捷键。"
+        ))
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 10))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            stack.widthAnchor.constraint(equalToConstant: 252)
+        ])
+        container.frame.size = container.fittingSize
+        container.setAccessibilityElement(true)
+        container.setAccessibilityRole(.group)
+        container.setAccessibilityLabel("\(binding.target.name) 的快捷键说明")
+        return container
+    }
+
+    private static func section(title: String, body: String) -> NSView {
+        let stack = NSStackView(views: [heading(title), paragraph(body)])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        return stack
+    }
+
+    private static func heading(_ text: String) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = .systemFont(ofSize: 11, weight: .semibold)
+        field.textColor = .secondaryLabelColor
+        return field
+    }
+
+    private static func paragraph(_ text: String) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: 12)
+        field.preferredMaxLayoutWidth = 252
+        return field
+    }
+
+    private static func keyRow(action: String, keys: String) -> NSView {
+        let actionLabel = NSTextField(labelWithString: action)
+        actionLabel.font = .systemFont(ofSize: 12)
+        actionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let keyLabel = NSTextField(labelWithString: keys)
+        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+        let row = NSStackView(views: [actionLabel, spacer, keyLabel])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.widthAnchor.constraint(equalToConstant: 252).isActive = true
+        row.setAccessibilityLabel("\(action)，\(keys)")
+        return row
+    }
+}
+
+private final class PendingApplicationPickerController: NSViewController, NSSearchFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    var onPick: ((URL) -> Void)?
+    var onChooseFromDisk: (() -> Void)?
+
+    private var applications: [ScannedApplication] = []
+    private var filtered: [ScannedApplication] = []
+    private let searchField = NSSearchField()
+    private let tableView = NSTableView()
+    private let emptyLabel = NSTextField(wrappingLabelWithString: "")
+    private let countLabel = NSTextField(labelWithString: "")
+
+    override func loadView() {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 336))
+        view = root
+
+        searchField.placeholderString = "搜索已安装的应用"
+        searchField.delegate = self
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        searchField.setAccessibilityLabel("搜索待添加应用")
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
+        column.resizingMask = .autoresizingMask
+        tableView.headerView = nil
+        tableView.addTableColumn(column)
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.rowHeight = 30
+        tableView.allowsEmptySelection = false
+        tableView.allowsMultipleSelection = false
+        tableView.target = self
+        tableView.doubleAction = #selector(addSelected)
+        tableView.setAccessibilityLabel("待添加应用列表")
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+
+        let scroll = NSScrollView()
+        scroll.documentView = tableView
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        emptyLabel.stringValue = "没有可添加的可视应用。"
+        emptyLabel.alignment = .center
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.font = .systemFont(ofSize: 12)
+        emptyLabel.isHidden = true
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        countLabel.font = .systemFont(ofSize: 11)
+        countLabel.textColor = .secondaryLabelColor
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let hint = NSTextField(labelWithString: "双击添加，不会自动设置快捷键。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        let diskButton = NSButton(title: "从磁盘选择…", target: self, action: #selector(chooseFromDisk))
+        diskButton.bezelStyle = .rounded
+        diskButton.setAccessibilityLabel("从磁盘选择应用")
+        diskButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let addButton = NSButton(title: "添加", target: self, action: #selector(addSelected))
+        addButton.bezelStyle = .rounded
+        addButton.keyEquivalent = "\r"
+        addButton.setAccessibilityLabel("添加选中的应用")
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(searchField)
+        root.addSubview(scroll)
+        root.addSubview(emptyLabel)
+        root.addSubview(countLabel)
+        root.addSubview(hint)
+        root.addSubview(diskButton)
+        root.addSubview(addButton)
+
+        NSLayoutConstraint.activate([
+            searchField.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            searchField.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            scroll.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
+            scroll.bottomAnchor.constraint(equalTo: hint.topAnchor, constant: -8),
+            emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            emptyLabel.widthAnchor.constraint(lessThanOrEqualTo: scroll.widthAnchor, constant: -24),
+            hint.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
+            hint.trailingAnchor.constraint(lessThanOrEqualTo: searchField.trailingAnchor),
+            countLabel.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
+            countLabel.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            diskButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -8),
+            diskButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
+            addButton.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
+            addButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
+            hint.bottomAnchor.constraint(equalTo: addButton.topAnchor, constant: -8)
+        ])
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(searchField)
+    }
+
+    func reload(excluding excludedBundleIDs: Set<String>) {
+        applications = ApplicationScanner.visibleApplications(excluding: excludedBundleIDs)
+        applyFilter()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        applyFilter()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { filtered.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let item = filtered[row]
+        let identifier = NSUserInterfaceItemIdentifier("PendingAppCell")
+        let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+            ?? makeCell(identifier: identifier)
+        let icon = NSWorkspace.shared.icon(forFile: item.path)
+        icon.size = NSSize(width: 18, height: 18)
+        cell.imageView?.image = icon
+        cell.textField?.stringValue = item.name
+        cell.setAccessibilityLabel(item.name)
+        return cell
+    }
+
+    @objc private func addSelected() {
+        let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
+        guard filtered.indices.contains(row) else { return }
+        onPick?(filtered[row].url)
+    }
+
+    @objc private func chooseFromDisk() {
+        onChooseFromDisk?()
+    }
+
+    private func applyFilter() {
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            filtered = applications
+        } else {
+            filtered = applications.filter { $0.name.localizedStandardContains(query) }
+        }
+        tableView.reloadData()
+        if !filtered.isEmpty { tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+        emptyLabel.isHidden = !filtered.isEmpty
+        if applications.isEmpty {
+            emptyLabel.stringValue = "没有可添加的可视应用。"
+            countLabel.stringValue = "0 个待添加"
+        } else if filtered.isEmpty {
+            emptyLabel.stringValue = "没有匹配的应用。"
+            countLabel.stringValue = "0 / \(applications.count)"
+        } else {
+            countLabel.stringValue = "\(filtered.count) 个待添加"
+        }
+    }
+
+    private func makeCell(identifier: NSUserInterfaceItemIdentifier) -> NSTableCellView {
+        let cell = NSTableCellView()
+        cell.identifier = identifier
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        let label = NSTextField(labelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12.5)
+        label.lineBreakMode = .byTruncatingTail
+        cell.addSubview(icon)
+        cell.addSubview(label)
+        cell.imageView = icon
+        cell.textField = label
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            icon.heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        ])
+        return cell
+    }
+}
+
 // MARK: - Transactional Carbon hot key
 
 private enum HotKeyFailure: Error, Equatable {
@@ -394,23 +809,35 @@ private enum RestoreDecision: Equatable {
 }
 
 private enum RestorePlanner {
+    static let freshSessionLimit: TimeInterval = 0.8
+
     static func decide(
         original: OriginalStateKind,
         sameProcess: Bool,
         targetIsFrontmost: Bool,
+        targetIsActive: Bool,
         targetIsHidden: Bool,
-        restoredWindowIsMinimized: Bool?,
-        hasPreviousApplication: Bool
+        foreignAppIsFrontmost: Bool,
+        sessionIsFresh: Bool,
+        restoredWindowIsMinimized: Bool?
     ) -> RestoreDecision {
-        guard sameProcess, targetIsFrontmost else { return .none }
+        guard sameProcess else { return .none }
+        let stillOurs = targetIsFrontmost || targetIsActive || sessionIsFresh || !foreignAppIsFrontmost
         switch original {
-        case .hidden, .degraded, .launched:
-            return targetIsHidden ? .none : .hideTarget
+        case .hidden, .degraded, .launched, .visible:
+            if targetIsHidden { return .none }
+            // Second press must hide when this session still owns the toggle.
+            // Requiring frontmost alone drops Electron / menu-bar apps and
+            // double-presses that arrive before activate() has settled.
+            return stillOurs ? .hideTarget : .none
         case .minimized:
-            return restoredWindowIsMinimized == false ? .minimizeExactWindow : .none
-        case .visible:
-            return hasPreviousApplication ? .activatePrevious : .none
+            if restoredWindowIsMinimized != false { return .none }
+            return stillOurs ? .minimizeExactWindow : .none
         }
+    }
+
+    static func shouldRevealAfter(_ decision: RestoreDecision) -> Bool {
+        decision == .none
     }
 }
 
@@ -478,6 +905,7 @@ private struct ToggleSession {
     let targetProcessIdentifier: pid_t
     let previousProcessIdentifier: pid_t?
     let state: CapturedState
+    let createdAt: Date
 }
 
 private enum LaunchPolicy {
@@ -487,8 +915,8 @@ private enum LaunchPolicy {
 }
 
 private enum RevealPolicy {
-    static func shouldHideImmediately(targetIsFrontmost: Bool) -> Bool {
-        targetIsFrontmost
+    static func shouldHideImmediately(targetIsFrontmost: Bool, onScreenWindowCount: Int) -> Bool {
+        targetIsFrontmost && onScreenWindowCount > 0
     }
 
     static func shouldReopen(windowCount: Int) -> Bool {
@@ -496,14 +924,41 @@ private enum RevealPolicy {
     }
 }
 
+private enum WindowPresence {
+    static func isUsableWindow(_ info: [String: Any], pid: pid_t) -> Bool {
+        let owner: pid_t?
+        if let value = info[kCGWindowOwnerPID as String] as? pid_t {
+            owner = value
+        } else if let number = info[kCGWindowOwnerPID as String] as? NSNumber {
+            owner = pid_t(truncating: number)
+        } else {
+            owner = nil
+        }
+        guard owner == pid,
+              (info[kCGWindowLayer as String] as? Int) == 0,
+              let bounds = info[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
+        return (bounds["Width"] ?? 0) > 64 && (bounds["Height"] ?? 0) > 64
+    }
+
+    static func onScreenCount(for pid: pid_t) -> Int {
+        let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        return list.filter { isUsableWindow($0, pid: pid) }.count
+    }
+}
+
 private final class ToggleEngine {
     var onStatus: ((String) -> Void)?
     private var session: ToggleSession?
     private var isLaunching = false
+    private var launchGeneration = 0
 
     func cancelSession() {
         session = nil
         isLaunching = false
+        launchGeneration += 1
     }
 
     func toggle(_ target: TargetApplication, launchIfNeeded: Bool) {
@@ -512,11 +967,11 @@ private final class ToggleEngine {
             return
         }
         if let session {
-            restore(target, session: session)
             self.session = nil
-        } else {
-            reveal(target, launchIfNeeded: launchIfNeeded)
+            let decision = restore(target, session: session)
+            if !RestorePlanner.shouldRevealAfter(decision) { return }
         }
+        reveal(target, launchIfNeeded: launchIfNeeded)
     }
 
     private func reveal(_ target: TargetApplication, launchIfNeeded: Bool) {
@@ -538,7 +993,8 @@ private final class ToggleEngine {
             let previous = previousFrontmostProcessIdentifier(excluding: nil)
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = true
-            isLaunching = true
+            configuration.createsNewApplicationInstance = false
+            beginLaunch()
             workspace.openApplication(at: resolvedURL, configuration: configuration) { [weak self] app, error in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -550,7 +1006,8 @@ private final class ToggleEngine {
                     self.session = ToggleSession(
                         targetProcessIdentifier: app.processIdentifier,
                         previousProcessIdentifier: previous,
-                        state: .launched
+                        state: .launched,
+                        createdAt: Date()
                     )
                     _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
                     self.onStatus?("已启动并呼出 \(target.name)。")
@@ -559,95 +1016,91 @@ private final class ToggleEngine {
             return
         }
 
-        let previous = previousFrontmostProcessIdentifier(excluding: running.processIdentifier)
-        if running.isHidden {
-            _ = running.unhide()
-            guard running.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
+        let current = refreshed(running)
+        let previous = previousFrontmostProcessIdentifier(excluding: current.processIdentifier)
+        let onScreenWindows = WindowPresence.onScreenCount(for: current.processIdentifier)
+        if current.isHidden {
+            _ = current.unhide()
+            guard current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
                 onStatus?("无法激活目标应用。")
                 return
             }
+            if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
+                reopenRunningApplication(current, previous: previous, target: target)
+                return
+            }
             session = ToggleSession(
-                targetProcessIdentifier: running.processIdentifier,
+                targetProcessIdentifier: current.processIdentifier,
                 previousProcessIdentifier: previous,
-                state: .hidden
+                state: .hidden,
+                createdAt: Date()
             )
             onStatus?("已呼出 \(target.name)；再次按键会恢复隐藏状态。")
             return
         }
 
-        if RevealPolicy.shouldHideImmediately(targetIsFrontmost: running.isActive) {
-            guard running.hide() else {
+        if RevealPolicy.shouldHideImmediately(
+            targetIsFrontmost: appearsFront(current),
+            onScreenWindowCount: onScreenWindows
+        ) {
+            guard current.hide() else {
                 onStatus?("无法隐藏目标应用。")
                 return
             }
+            activatePrevious(previous)
             onStatus?("\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。")
             return
         }
 
         if Accessibility.isTrusted {
-            let windows = Accessibility.windows(for: running.processIdentifier)
+            let windows = Accessibility.windows(for: current.processIdentifier)
             if RevealPolicy.shouldReopen(windowCount: windows.count) {
-                reopenRunningApplication(running, previous: previous, target: target)
+                reopenRunningApplication(current, previous: previous, target: target)
                 return
             }
             let minimizedWindows = windows.filter { Accessibility.isMinimized($0) == true }
             let visibleWindowExists = windows.contains { Accessibility.isMinimized($0) == false }
             if !visibleWindowExists, let restoredWindow = minimizedWindows.first {
                 guard Accessibility.setMinimized(false, window: restoredWindow) else {
-                    reopenRunningApplication(running, previous: previous, target: target)
+                    reopenRunningApplication(current, previous: previous, target: target)
                     return
                 }
                 Accessibility.raise(restoredWindow)
-                _ = running.activate(options: .activateIgnoringOtherApps)
+                _ = current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+                if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
+                    reopenRunningApplication(current, previous: previous, target: target)
+                    return
+                }
                 session = ToggleSession(
-                    targetProcessIdentifier: running.processIdentifier,
+                    targetProcessIdentifier: current.processIdentifier,
                     previousProcessIdentifier: previous,
-                    state: .minimized(restoredWindow)
+                    state: .minimized(restoredWindow),
+                    createdAt: Date()
                 )
                 onStatus?("已恢复一个最小化窗口；再次按键只会重新最小化这个窗口。")
                 return
             }
-
-            guard running.activate(options: .activateIgnoringOtherApps) else {
-                onStatus?("无法激活目标应用。")
-                return
-            }
-            session = ToggleSession(
-                targetProcessIdentifier: running.processIdentifier,
-                previousProcessIdentifier: previous,
-                state: .visible
-            )
-            onStatus?("已呼出 \(target.name)；再次按键会恢复之前的前台应用。")
-            return
         }
 
-        let windowList = CGWindowListCopyWindowInfo(
-            [.optionAll, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] ?? []
-        // ponytail: Without AX, size is the smallest safe filter for menu/helper surfaces.
-        let existingWindowCount = windowList.filter {
-            guard ($0[kCGWindowOwnerPID as String] as? pid_t) == running.processIdentifier,
-                  ($0[kCGWindowLayer as String] as? Int) == 0,
-                  let bounds = $0[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
-            return (bounds["Width"] ?? 0) > 64 && (bounds["Height"] ?? 0) > 64
-        }.count
-        guard RevealPolicy.shouldReopen(
-            windowCount: existingWindowCount
-        ) else {
-            guard running.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
-                onStatus?("无法激活目标应用。")
-                return
-            }
-            session = ToggleSession(
-                targetProcessIdentifier: running.processIdentifier,
-                previousProcessIdentifier: previous,
-                state: .visible
-            )
-            onStatus?("已呼出 \(target.name)；再次按键会恢复之前的前台应用。")
+        if RevealPolicy.shouldReopen(windowCount: onScreenWindows) {
+            reopenRunningApplication(current, previous: previous, target: target)
             return
         }
-        reopenRunningApplication(running, previous: previous, target: target)
+        guard current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
+            onStatus?("无法激活目标应用。")
+            return
+        }
+        if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
+            reopenRunningApplication(current, previous: previous, target: target)
+            return
+        }
+        session = ToggleSession(
+            targetProcessIdentifier: current.processIdentifier,
+            previousProcessIdentifier: previous,
+            state: .visible,
+            createdAt: Date()
+        )
+        onStatus?("已呼出 \(target.name)；再次按键会安全隐藏。")
     }
 
     private func reopenRunningApplication(
@@ -664,7 +1117,8 @@ private final class ToggleEngine {
         }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
-        isLaunching = true
+        configuration.createsNewApplicationInstance = false
+        beginLaunch()
         workspace.openApplication(at: resolvedURL, configuration: configuration) { [weak self] app, error in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -678,25 +1132,24 @@ private final class ToggleEngine {
                 self.session = ToggleSession(
                     targetProcessIdentifier: reopened.processIdentifier,
                     previousProcessIdentifier: previous,
-                    state: .degraded
+                    state: .degraded,
+                    createdAt: Date()
                 )
                 self.onStatus?("已重新打开并呼出 \(target.name)；再次按键将安全隐藏。")
             }
         }
     }
 
-    private func restore(_ target: TargetApplication, session: ToggleSession) {
+    private func restore(_ target: TargetApplication, session: ToggleSession) -> RestoreDecision {
         let workspace = NSWorkspace.shared
         guard let running = workspace.runningApplications.first(where: {
             $0.bundleIdentifier == target.bundleIdentifier
         }) else {
-            onStatus?("目标应用已经退出，本次不执行恢复。")
-            return
+            return .none
         }
 
-        let sameProcess = running.processIdentifier == session.targetProcessIdentifier
-        let targetIsFrontmost = workspace.frontmostApplication?.processIdentifier == running.processIdentifier
-        let previousExists = session.previousProcessIdentifier.flatMap(runningApplication) != nil
+        let current = refreshed(running)
+        let sameProcess = current.processIdentifier == session.targetProcessIdentifier
         let windowMinimized: Bool?
         if case .minimized(let window) = session.state {
             windowMinimized = Accessibility.isMinimized(window)
@@ -707,17 +1160,19 @@ private final class ToggleEngine {
         let decision = RestorePlanner.decide(
             original: session.state.kind,
             sameProcess: sameProcess,
-            targetIsFrontmost: targetIsFrontmost,
-            targetIsHidden: running.isHidden,
-            restoredWindowIsMinimized: windowMinimized,
-            hasPreviousApplication: previousExists
+            targetIsFrontmost: workspace.frontmostApplication?.processIdentifier == current.processIdentifier,
+            targetIsActive: current.isActive,
+            targetIsHidden: current.isHidden,
+            foreignAppIsFrontmost: foreignRegularAppIsFrontmost(excluding: current.processIdentifier),
+            sessionIsFresh: Date().timeIntervalSince(session.createdAt) < RestorePlanner.freshSessionLimit,
+            restoredWindowIsMinimized: windowMinimized
         )
 
         switch decision {
         case .hideTarget:
-            guard running.hide() else {
+            guard current.hide() else {
                 onStatus?("系统暂时无法隐藏目标应用；没有关闭任何窗口。")
-                return
+                return decision
             }
             activatePrevious(session.previousProcessIdentifier)
             onStatus?("已恢复按键前状态；没有关闭任何窗口。")
@@ -726,7 +1181,7 @@ private final class ToggleEngine {
                   Accessibility.isTrusted,
                   Accessibility.setMinimized(true, window: window) else {
                 onStatus?("窗口状态已变化，本次未自动最小化。")
-                return
+                return decision
             }
             activatePrevious(session.previousProcessIdentifier)
             onStatus?("已只重新最小化本次恢复的窗口。")
@@ -734,8 +1189,9 @@ private final class ToggleEngine {
             activatePrevious(session.previousProcessIdentifier)
             onStatus?("目标窗口保持显示，已恢复之前的前台应用。")
         case .none:
-            onStatus?("检测到应用状态已变化，本次没有隐藏、最小化或关闭窗口。")
+            return .none
         }
+        return decision
     }
 
     private func previousFrontmostProcessIdentifier(excluding targetPID: pid_t?) -> pid_t? {
@@ -752,6 +1208,36 @@ private final class ToggleEngine {
     private func activatePrevious(_ processIdentifier: pid_t?) {
         guard let processIdentifier, let previous = runningApplication(processIdentifier) else { return }
         _ = previous.activate(options: .activateIgnoringOtherApps)
+    }
+
+    private func refreshed(_ running: NSRunningApplication) -> NSRunningApplication {
+        NSRunningApplication(processIdentifier: running.processIdentifier) ?? running
+    }
+
+    private func appearsFront(_ running: NSRunningApplication) -> Bool {
+        running.isActive
+            || NSWorkspace.shared.frontmostApplication?.processIdentifier == running.processIdentifier
+    }
+
+    private func foreignRegularAppIsFrontmost(excluding targetPID: pid_t) -> Bool {
+        guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
+        let pid = frontmost.processIdentifier
+        if pid == targetPID { return false }
+        if pid == ProcessInfo.processInfo.processIdentifier { return false }
+        if frontmost.isHidden { return false }
+        if frontmost.activationPolicy != .regular { return false }
+        return true
+    }
+
+    private func beginLaunch() {
+        isLaunching = true
+        launchGeneration += 1
+        let generation = launchGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+            guard let self, self.isLaunching, self.launchGeneration == generation else { return }
+            self.isLaunching = false
+            self.onStatus?("目标应用启动超时，可再试一次。")
+        }
     }
 }
 
@@ -1150,7 +1636,7 @@ private final class GlassCardView: NSVisualEffectView {
         blendingMode = .withinWindow
         state = .active
         wantsLayer = true
-        layer?.cornerRadius = 18
+        layer?.cornerRadius = 12
         layer?.masksToBounds = true
         updateColors()
     }
@@ -1240,18 +1726,20 @@ private final class SettingsController: NSObject {
     private let accentRail = AccentRailView(frame: .zero)
     private var guideAccentIcons: [NSImageView] = []
     private var lastRenderedBindings: [AppBinding]?
-    private var guideExpanded = true
+    private var guideExpanded = false
     private var appGuideExpanded = false
     private var colorTheme = ColorTheme.aurora
-
-    private let collapsedHeight: CGFloat = 630
-    private let expandedHeight: CGFloat = 852
+    private let helpPopover = NSPopover()
+    private let addPopover = NSPopover()
+    private let pendingPicker = PendingApplicationPickerController()
 
     init(model: QuickToggleModel) {
         self.model = model
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let height = min(640, max(500, visible.height - 48))
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: expandedHeight),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: height),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -1263,18 +1751,21 @@ private final class SettingsController: NSObject {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.backgroundColor = .clear
-        window.isOpaque = false
+        window.minSize = NSSize(width: 600, height: 500)
+        window.maxSize = NSSize(width: 720, height: max(visible.height - 24, 560))
         window.isReleasedWhenClosed = false
+        applyAccessibilityChrome()
         window.center()
         buildInterface()
         refresh()
     }
 
     func show() {
+        applyAccessibilityChrome()
         refresh()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        window.recalculateKeyViewLoop()
     }
 
     func refresh() {
@@ -1329,7 +1820,7 @@ private final class SettingsController: NSObject {
         settingsShortcutRecorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
         settingsShortcutRecorder.setAccessibilityLabel("轻唤设置窗口快捷键")
         settingsShortcutRecorder.setAccessibilityHelp("点击后录制新的显示或隐藏设置窗口快捷键；推荐 Command 加任意数字，Esc 取消。")
-        settingsShortcutRecorder.toolTip = "点击更换；推荐 ⌘ + 任意数字（0–9）"
+        settingsShortcutRecorder.toolTip = "点击更换；推荐 ⌘0–9，也可用 ⌘⌥K / ⌘⇧K"
         let titleRow = horizontalStack([title, productIdentity, settingsShortcutRecorder], spacing: 9)
         titleRow.alignment = .lastBaseline
         let subtitle = NSTextField(labelWithString: "每个应用一组快捷键。按一下呼出，再按一次安全恢复。")
@@ -1364,7 +1855,8 @@ private final class SettingsController: NSObject {
 
         let applicationsCard = GlassCardView(frame: .zero)
         applicationsCard.setAccessibilityLabel("应用快捷键列表")
-        applicationsCard.heightAnchor.constraint(equalToConstant: 300).isActive = true
+        applicationsCard.setContentHuggingPriority(.defaultLow, for: .vertical)
+        applicationsCard.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
         let listTitle = NSTextField(labelWithString: "应用快捷键")
         listTitle.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -1384,6 +1876,7 @@ private final class SettingsController: NSObject {
         addButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
         addButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
         addButton.setAccessibilityLabel("添加目标应用")
+        addButton.setAccessibilityHelp("打开已安装可视应用列表；也可从磁盘选择。添加后不会自动设置快捷键。")
         let listHeader = horizontalStack([listTitle, countLabel, listHeaderSpacer, addButton], spacing: 8)
         listHeader.alignment = .centerY
 
@@ -1392,14 +1885,16 @@ private final class SettingsController: NSObject {
         bindingsStack.orientation = .vertical
         bindingsStack.alignment = .leading
         bindingsStack.distribution = .fill
-        bindingsStack.spacing = 10
+        bindingsStack.spacing = 6
         bindingsStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
         listScroll.documentView = bindingsStack
         listScroll.hasVerticalScroller = true
         listScroll.autohidesScrollers = true
         listScroll.borderType = .noBorder
         listScroll.drawsBackground = false
-        listScroll.heightAnchor.constraint(equalToConstant: 170).isActive = true
+        listScroll.setContentHuggingPriority(.init(1), for: .vertical)
+        listScroll.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 168).isActive = true
 
         statusDot.widthAnchor.constraint(equalToConstant: 10).isActive = true
         statusDot.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -1411,30 +1906,24 @@ private final class SettingsController: NSObject {
         let statusRow = horizontalStack([statusDot, generalStatus], spacing: 8)
         statusRow.alignment = .centerY
 
-        let applicationsStack = verticalStack([listHeader, accentRail, listScroll, statusRow], spacing: 10)
-        pin(applicationsStack, inside: applicationsCard, insets: NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18))
+        let applicationsStack = verticalStack([listHeader, accentRail, listScroll, statusRow], spacing: 8)
+        pin(applicationsStack, inside: applicationsCard, insets: NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14))
         [listHeader, accentRail, listScroll, statusRow].forEach {
             $0.widthAnchor.constraint(equalTo: applicationsStack.widthAnchor).isActive = true
         }
 
-        let permissionCard = GlassCardView(frame: .zero)
-        permissionCard.setAccessibilityLabel("辅助功能权限")
-        permissionCard.heightAnchor.constraint(equalToConstant: 82).isActive = true
         permissionIcon.image = NSImage(
             systemSymbolName: "lock.shield",
             accessibilityDescription: "窗口恢复能力"
-        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 22, weight: .medium))
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 16, weight: .medium))
         permissionIcon.contentTintColor = colorTheme.primary
-        permissionIcon.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        permissionIcon.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        permissionIcon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        permissionIcon.heightAnchor.constraint(equalToConstant: 18).isActive = true
 
-        let permissionTitle = NSTextField(labelWithString: "窗口恢复能力")
-        permissionTitle.font = .systemFont(ofSize: 14, weight: .semibold)
         permissionStatus.font = .systemFont(ofSize: 11.5)
         permissionStatus.textColor = .secondaryLabelColor
-        permissionStatus.maximumNumberOfLines = 2
+        permissionStatus.lineBreakMode = .byTruncatingTail
         permissionStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let permissionLabels = verticalStack([permissionTitle, permissionStatus], spacing: 3)
         let permissionSpacer = NSView()
         permissionSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
@@ -1442,21 +1931,23 @@ private final class SettingsController: NSObject {
         permissionButton.target = self
         permissionButton.action = #selector(requestAccessibility)
         permissionButton.bezelStyle = .rounded
-        permissionButton.widthAnchor.constraint(equalToConstant: 142).isActive = true
-        permissionButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        permissionButton.controlSize = .small
+        permissionButton.widthAnchor.constraint(equalToConstant: 118).isActive = true
+        permissionButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         permissionButton.setAccessibilityHelp("只在点击后请求系统辅助功能权限。")
         let permissionRow = horizontalStack(
-            [permissionIcon, permissionLabels, permissionSpacer, permissionButton],
-            spacing: 12
+            [permissionIcon, permissionStatus, permissionSpacer, permissionButton],
+            spacing: 8
         )
         permissionRow.alignment = .centerY
-        pin(permissionRow, inside: permissionCard, insets: NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16))
+        permissionRow.setAccessibilityLabel("辅助功能权限")
+        permissionRow.setContentHuggingPriority(.required, for: .vertical)
 
         guideButton.title = "macOS 原生快捷键"
         guideButton.target = self
         guideButton.action = #selector(toggleGuide)
         guideButton.bezelStyle = .inline
-        guideButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)
+        guideButton.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
         guideButton.imagePosition = .imageLeading
         guideButton.contentTintColor = .secondaryLabelColor
         guideButton.font = .systemFont(ofSize: 13, weight: .medium)
@@ -1485,7 +1976,7 @@ private final class SettingsController: NSObject {
         nativeNote.maximumNumberOfLines = 2
 
         let customGuide = NSTextField(wrappingLabelWithString:
-            "应用与设置快捷键优先推荐 ⌘ + 任意数字（0–9）；使用字母、方向键或 F 键时，至少两个修饰键并包含 Command 或 Control。系统保留组合会被阻止。"
+            "优先推荐未占用的 ⌘0–9。其他可用：⌘⌥K、⌘⇧K、⌃⇧K、⌘⌥←/→、⌃⇧F1–F12。字母、方向键或 F 键至少两个修饰键，并包含 Command 或 Control。系统保留和高风险组合仍会阻止或警告。"
         )
         customGuide.font = .systemFont(ofSize: 11.5)
         customGuide.textColor = .tertiaryLabelColor
@@ -1495,7 +1986,7 @@ private final class SettingsController: NSObject {
         [shortcutGrid, nativeNote, customGuide].forEach {
             $0.widthAnchor.constraint(equalTo: guideContent.widthAnchor).isActive = true
         }
-        guideCard.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        guideCard.heightAnchor.constraint(equalToConstant: 168).isActive = true
         guideCard.setAccessibilityLabel("macOS 原生快捷键指南")
         pin(guideContent, inside: guideCard, insets: NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18))
 
@@ -1512,22 +2003,16 @@ private final class SettingsController: NSObject {
         appGuideButton.setAccessibilityLabel("展开或收起应用内快捷键")
 
         let applicationRows = [
+            ("com.tencent.xinWeChat", "微信"),
+            ("com.openai.codex", "Codex"),
+            ("com.google.Chrome", "Chrome")
+        ].compactMap { identifier, name in
             makeApplicationShortcutRow(
-                bundleIdentifier: "com.tencent.xinWeChat",
-                name: "微信",
-                shortcuts: [("常见：呼出主窗口", "⇧⌘ W")]
-            ),
-            makeApplicationShortcutRow(
-                bundleIdentifier: "com.openai.codex",
-                name: "Codex",
-                shortcuts: [("命令菜单", "⌘ K"), ("新建对话", "⌘ N")]
-            ),
-            makeApplicationShortcutRow(
-                bundleIdentifier: "com.google.Chrome",
-                name: "Chrome",
-                shortcuts: [("定位地址栏", "⌘ L"), ("重开关闭标签", "⇧⌘ T")]
+                bundleIdentifier: identifier,
+                name: name,
+                shortcuts: ConfirmedAppShortcuts.entries(for: identifier)
             )
-        ].compactMap { $0 }
+        }
         let applicationList: NSView
         if applicationRows.isEmpty {
             let empty = NSTextField(wrappingLabelWithString: "暂未检测到支持的常用应用。")
@@ -1549,8 +2034,9 @@ private final class SettingsController: NSObject {
         [applicationList, applicationNote].forEach {
             $0.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         }
-        appGuideCard.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        appGuideCard.heightAnchor.constraint(equalToConstant: 148).isActive = true
         appGuideCard.isHidden = true
+        guideCard.isHidden = true
         appGuideCard.setAccessibilityLabel("已安装应用的快捷键参考")
         pin(
             applicationGuideContent,
@@ -1558,22 +2044,37 @@ private final class SettingsController: NSObject {
             insets: NSEdgeInsets(top: 12, left: 18, bottom: 12, right: 18)
         )
 
+        pendingPicker.onPick = { [weak self] url in
+            self?.addPopover.performClose(nil)
+            _ = self?.model.addTarget(url: url)
+        }
+        pendingPicker.onChooseFromDisk = { [weak self] in
+            self?.addPopover.performClose(nil)
+            self?.chooseApplicationFromDisk()
+        }
+        addPopover.contentViewController = pendingPicker
+        addPopover.behavior = .transient
+        helpPopover.behavior = .transient
         applyColorTheme(rebuildRows: false)
+        applyAccessibilityChrome()
 
         let rootStack = verticalStack(
-            [header, applicationsCard, permissionCard, guideButton, guideCard, appGuideButton, appGuideCard],
-            spacing: 14
+            [header, applicationsCard, permissionRow, guideButton, guideCard, appGuideButton, appGuideCard],
+            spacing: 10
         )
         rootStack.translatesAutoresizingMaskIntoConstraints = false
         material.addSubview(rootStack)
+        header.setContentHuggingPriority(.required, for: .vertical)
+        guideButton.setContentHuggingPriority(.required, for: .vertical)
+        appGuideButton.setContentHuggingPriority(.required, for: .vertical)
         NSLayoutConstraint.activate([
-            rootStack.leadingAnchor.constraint(equalTo: material.leadingAnchor, constant: 24),
-            rootStack.trailingAnchor.constraint(equalTo: material.trailingAnchor, constant: -24),
-            rootStack.topAnchor.constraint(equalTo: material.topAnchor, constant: 43),
-            rootStack.bottomAnchor.constraint(lessThanOrEqualTo: material.bottomAnchor, constant: -20),
+            rootStack.leadingAnchor.constraint(equalTo: material.leadingAnchor, constant: 20),
+            rootStack.trailingAnchor.constraint(equalTo: material.trailingAnchor, constant: -20),
+            rootStack.topAnchor.constraint(equalTo: material.topAnchor, constant: 36),
+            rootStack.bottomAnchor.constraint(equalTo: material.bottomAnchor, constant: -14),
             header.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             applicationsCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            permissionCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            permissionRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             guideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             guideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
@@ -1583,6 +2084,8 @@ private final class SettingsController: NSObject {
     }
 
     private func rebuildBindingRows() {
+        helpPopover.performClose(nil)
+        addPopover.performClose(nil)
         bindingsStack.arrangedSubviews.forEach {
             bindingsStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
@@ -1593,14 +2096,14 @@ private final class SettingsController: NSObject {
             empty.alignment = .center
             empty.textColor = .secondaryLabelColor
             empty.font = .systemFont(ofSize: 13, weight: .medium)
-            empty.heightAnchor.constraint(equalToConstant: 82).isActive = true
+            empty.heightAnchor.constraint(equalToConstant: 56).isActive = true
             empty.setAccessibilityLabel("尚未添加应用")
             bindingsStack.addArrangedSubview(empty)
         } else {
             model.bindings.forEach { bindingsStack.addArrangedSubview(makeBindingRow($0)) }
         }
 
-        let width = max(listScroll.contentSize.width, 600)
+        let width = max(listScroll.contentSize.width, 560)
         bindingsStack.frame = NSRect(x: 0, y: 0, width: width, height: 1)
         bindingsStack.layoutSubtreeIfNeeded()
         bindingsStack.frame.size.height = max(bindingsStack.fittingSize.height, listScroll.contentSize.height)
@@ -1612,37 +2115,34 @@ private final class SettingsController: NSObject {
     private func makeBindingRow(_ binding: AppBinding) -> NSView {
         let row = NSBox()
         row.boxType = .custom
-        row.cornerRadius = 12
+        row.cornerRadius = 8
         row.borderWidth = 1
         row.borderColor = .separatorColor.withAlphaComponent(0.45)
         row.fillColor = .controlBackgroundColor.withAlphaComponent(0.34)
-        row.heightAnchor.constraint(equalToConstant: 82).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 52).isActive = true
         row.setAccessibilityLabel("\(binding.target.name) 快捷键设置")
 
         let icon = NSImageView()
         let image = NSWorkspace.shared.icon(forFile: binding.target.path)
-        image.size = NSSize(width: 40, height: 40)
+        image.size = NSSize(width: 28, height: 28)
         icon.image = image
         icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
         icon.setAccessibilityLabel("\(binding.target.name) 图标")
 
         let name = NSTextField(labelWithString: binding.target.name)
-        name.font = .systemFont(ofSize: 15, weight: .semibold)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
         name.lineBreakMode = .byTruncatingTail
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let detail = NSTextField(labelWithString: "按一下呼出，再按一次恢复")
-        detail.font = .systemFont(ofSize: 11.5)
-        detail.textColor = .secondaryLabelColor
 
         let autoOpen = NSButton(checkboxWithTitle: "未运行时自动打开", target: self, action: #selector(toggleLaunchIfNeeded(_:)))
         autoOpen.identifier = NSUserInterfaceItemIdentifier(binding.id.uuidString)
         autoOpen.state = binding.launchIfNeeded ? .on : .off
-        autoOpen.controlSize = .small
-        autoOpen.font = .systemFont(ofSize: 11.5)
+        autoOpen.controlSize = .mini
+        autoOpen.font = .systemFont(ofSize: 11)
         autoOpen.setAccessibilityLabel("\(binding.target.name) 未运行时自动打开")
-        let labels = verticalStack([name, detail, autoOpen], spacing: 3)
+        let labels = verticalStack([name, autoOpen], spacing: 1)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1660,10 +2160,30 @@ private final class SettingsController: NSObject {
             self?.generalStatus.stringValue = message
             self?.generalStatus.textColor = .systemRed
         }
-        recorder.widthAnchor.constraint(equalToConstant: 132).isActive = true
-        recorder.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        recorder.controlSize = .small
+        recorder.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+        recorder.widthAnchor.constraint(equalToConstant: 108).isActive = true
+        recorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
         recorder.setAccessibilityLabel("\(binding.target.name) 快捷键录制")
-        recorder.toolTip = "推荐 ⌘ + 任意数字（0–9）；冲突时保留原快捷键"
+        recorder.toolTip = "推荐 ⌘0–9、⌘⌥K、⌘⇧K、⌃⇧K；冲突时保留原快捷键"
+
+        let helpButton = NSButton()
+        helpButton.image = NSImage(
+            systemSymbolName: "questionmark.circle",
+            accessibilityDescription: "说明"
+        )
+        helpButton.bezelStyle = .inline
+        helpButton.isBordered = false
+        helpButton.contentTintColor = .secondaryLabelColor
+        helpButton.target = self
+        helpButton.action = #selector(showBindingHelp(_:))
+        helpButton.identifier = NSUserInterfaceItemIdentifier(binding.id.uuidString)
+        helpButton.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        helpButton.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        helpButton.setAccessibilityLabel("\(binding.target.name) 的快捷键说明")
+        helpButton.setAccessibilityHelp("查看轻唤热键、已确认的应用快捷键，以及如何自行查看。")
+        helpButton.setAccessibilityRole(.button)
+        helpButton.toolTip = "查看这个应用的快捷键说明"
 
         let deleteButton = NSButton()
         deleteButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "删除")
@@ -1676,12 +2196,12 @@ private final class SettingsController: NSObject {
         deleteButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
         deleteButton.setAccessibilityLabel("移除 \(binding.target.name)")
 
-        let rowStack = horizontalStack([icon, labels, spacer, recorder, deleteButton], spacing: 12)
+        let rowStack = horizontalStack([icon, labels, spacer, recorder, helpButton, deleteButton], spacing: 10)
         rowStack.alignment = .centerY
         pin(
             rowStack,
             inside: row.contentView ?? row,
-            insets: NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 10)
+            insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 8)
         )
         return row
     }
@@ -1781,6 +2301,18 @@ private final class SettingsController: NSObject {
     }
 
     @objc private func chooseApplication() {
+        if addPopover.isShown {
+            addPopover.performClose(nil)
+            return
+        }
+        var excluded = Set(model.bindings.map(\.target.bundleIdentifier))
+        if let selfID = Bundle.main.bundleIdentifier { excluded.insert(selfID) }
+        pendingPicker.reload(excluding: excluded)
+        addPopover.contentSize = NSSize(width: 300, height: 336)
+        addPopover.show(relativeTo: addButton.bounds, of: addButton, preferredEdge: .maxY)
+    }
+
+    private func chooseApplicationFromDisk() {
         let panel = NSOpenPanel()
         panel.title = "添加要呼出的应用"
         panel.prompt = "添加"
@@ -1790,6 +2322,21 @@ private final class SettingsController: NSObject {
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         _ = model.addTarget(url: url)
+    }
+
+    @objc private func showBindingHelp(_ sender: NSButton) {
+        guard let rawValue = sender.identifier?.rawValue,
+              let id = UUID(uuidString: rawValue),
+              let binding = model.bindings.first(where: { $0.id == id }) else { return }
+        if helpPopover.isShown {
+            helpPopover.performClose(nil)
+            return
+        }
+        let controller = NSViewController()
+        controller.view = BindingHelpContent.view(for: binding)
+        helpPopover.contentViewController = controller
+        helpPopover.contentSize = controller.view.fittingSize
+        helpPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minX)
     }
 
     @objc private func toggleLaunchIfNeeded(_ sender: NSButton) {
@@ -1827,7 +2374,18 @@ private final class SettingsController: NSObject {
         permissionIcon.contentTintColor = colorTheme.primary
         guideAccentIcons.forEach { $0.contentTintColor = colorTheme.primary }
         enableButton.bezelColor = model.isEnabled ? colorTheme.primary : nil
+        applyAccessibilityChrome()
         if rebuildRows { rebuildBindingRows() }
+    }
+
+    private func applyAccessibilityChrome() {
+        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        window.isOpaque = reduced
+        window.backgroundColor = reduced ? .windowBackgroundColor : .clear
+        if let material = window.contentView as? NSVisualEffectView {
+            material.state = reduced ? .inactive : .active
+            material.material = reduced ? .contentBackground : .underWindowBackground
+        }
     }
 
     @objc private func toggleGuide() {
@@ -1853,16 +2411,7 @@ private final class SettingsController: NSObject {
             systemSymbolName: appGuideExpanded ? "chevron.down" : "chevron.right",
             accessibilityDescription: nil
         )
-        let oldFrame = window.frame
-        let height = guideExpanded || appGuideExpanded ? expandedHeight : collapsedHeight
-        var newFrame = oldFrame
-        newFrame.size.height = height
-        newFrame.origin.y = oldFrame.maxY - height
-        window.setFrame(
-            newFrame,
-            display: true,
-            animate: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        )
+        window.recalculateKeyViewLoop()
     }
 }
 // MARK: - Menu bar application
@@ -2014,9 +2563,12 @@ private enum SelfTest {
         checkStateMachine(&failures)
         checkLaunchPolicy(&failures)
         checkRevealPolicy(&failures)
+        checkWindowPresence(&failures)
         checkHotKeyRouting(&failures)
         checkMultiBindingPreferences(&failures)
         checkRecorderGate(&failures)
+        checkApplicationScanner(&failures)
+        checkConfirmedShortcuts(&failures)
 
         if failures.isEmpty {
             print("QuickToggle self-test passed")
@@ -2031,6 +2583,8 @@ private enum SelfTest {
         let validOption = Shortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(cmdKey | optionKey), label: "K")
         let validControl = Shortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey | shiftKey), label: "K")
         let validOpenDisplay = Shortcut(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | shiftKey), label: "O")
+        let validArrow = Shortcut(keyCode: UInt32(kVK_LeftArrow), modifiers: UInt32(cmdKey | optionKey), label: "←")
+        let validFunction = Shortcut(keyCode: UInt32(kVK_F1), modifiers: UInt32(controlKey | shiftKey), label: "F1")
         let tooFew = Shortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(cmdKey), label: "K")
         let noCommandOrControl = Shortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(optionKey | shiftKey), label: "K")
         let screenCapture = Shortcut(keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(cmdKey | shiftKey), label: "3")
@@ -2046,7 +2600,7 @@ private enum SelfTest {
             launchIfNeeded: true
         )
 
-        if [valid, validOption, validControl, validOpenDisplay]
+        if [valid, validOption, validControl, validOpenDisplay, validArrow, validFunction]
             .contains(where: { $0.validationError != nil }) {
             failures.append("recommended shortcuts were rejected")
         }
@@ -2100,43 +2654,114 @@ private enum SelfTest {
     }
 
     private static func checkStateMachine(_ failures: inout [String]) {
-        let hidden = RestorePlanner.decide(
-            original: .hidden,
-            sameProcess: true,
-            targetIsFrontmost: true,
-            targetIsHidden: false,
-            restoredWindowIsMinimized: nil,
-            hasPreviousApplication: true
-        )
-        let minimized = RestorePlanner.decide(
-            original: .minimized,
-            sameProcess: true,
-            targetIsFrontmost: true,
-            targetIsHidden: false,
-            restoredWindowIsMinimized: false,
-            hasPreviousApplication: true
-        )
-        let visible = RestorePlanner.decide(
-            original: .visible,
-            sameProcess: true,
-            targetIsFrontmost: true,
-            targetIsHidden: false,
-            restoredWindowIsMinimized: nil,
-            hasPreviousApplication: true
-        )
-        let userChangedState = RestorePlanner.decide(
-            original: .hidden,
-            sameProcess: true,
-            targetIsFrontmost: false,
-            targetIsHidden: false,
-            restoredWindowIsMinimized: nil,
-            hasPreviousApplication: true
-        )
+        func decide(
+            original: OriginalStateKind,
+            sameProcess: Bool = true,
+            frontmost: Bool = false,
+            active: Bool = false,
+            hidden: Bool = false,
+            foreign: Bool = false,
+            fresh: Bool = false,
+            minimized: Bool? = nil
+        ) -> RestoreDecision {
+            RestorePlanner.decide(
+                original: original,
+                sameProcess: sameProcess,
+                targetIsFrontmost: frontmost,
+                targetIsActive: active,
+                targetIsHidden: hidden,
+                foreignAppIsFrontmost: foreign,
+                sessionIsFresh: fresh,
+                restoredWindowIsMinimized: minimized
+            )
+        }
+
+        let hidden = decide(original: .hidden, frontmost: true)
+        let minimized = decide(original: .minimized, frontmost: true, minimized: false)
+        let visible = decide(original: .visible, frontmost: true)
+        let userChangedState = decide(original: .hidden, foreign: true)
+        let activateRace = decide(original: .hidden, foreign: true, fresh: true)
+        let accessory = decide(original: .visible)
+        let processRestarted = decide(original: .hidden, sameProcess: false, frontmost: true)
+        let alreadyHidden = decide(original: .hidden, hidden: true)
+        let hideFailedShouldNotReveal = RestorePlanner.shouldRevealAfter(.hideTarget)
+        let minimizeFailedShouldNotReveal = RestorePlanner.shouldRevealAfter(.minimizeExactWindow)
 
         if hidden != .hideTarget { failures.append("hidden branch did not restore hiding") }
         if minimized != .minimizeExactWindow { failures.append("minimized branch did not target the restored window") }
-        if visible != .activatePrevious { failures.append("visible branch did not restore the previous app") }
+        if visible != .hideTarget { failures.append("visible branch did not hide on the second press") }
         if userChangedState != .none { failures.append("manual state change was not protected") }
+        if !RestorePlanner.shouldRevealAfter(userChangedState) {
+            failures.append("manual state change did not fall through to a fresh reveal")
+        }
+        if RestorePlanner.shouldRevealAfter(hidden) {
+            failures.append("valid restore unexpectedly fell through to reveal")
+        }
+        if activateRace != .hideTarget {
+            failures.append("fresh second press did not hide before activate settled")
+        }
+        if accessory != .hideTarget {
+            failures.append("non-frontmost session did not hide accessory-style apps")
+        }
+        if processRestarted != .none || !RestorePlanner.shouldRevealAfter(processRestarted) {
+            failures.append("restarted target did not fall through to a fresh reveal")
+        }
+        if alreadyHidden != .none || !RestorePlanner.shouldRevealAfter(alreadyHidden) {
+            failures.append("already-hidden target did not fall through to a fresh reveal")
+        }
+        if hideFailedShouldNotReveal {
+            failures.append("failed hide unexpectedly fell through to reveal")
+        }
+        if minimizeFailedShouldNotReveal {
+            failures.append("failed minimize unexpectedly fell through to reveal")
+        }
+    }
+
+    private static func checkApplicationScanner(_ failures: inout [String]) {
+        if !ApplicationScanner.isExcludedPath("/Applications/Foo.app/Contents/Helpers/Bar.app") {
+            failures.append("helper path was accepted")
+        }
+        if !ApplicationScanner.isExcludedPath("/Applications/Foo.app/Contents/XPCServices/Service.app") {
+            failures.append("xpc path was accepted")
+        }
+        if !ApplicationScanner.isExcludedPath("/Applications/Foo.app/Contents/Frameworks/Plug.app") {
+            failures.append("framework path was accepted")
+        }
+        if ApplicationScanner.isExcludedPath("/Applications/Safari.app") {
+            failures.append("normal app path was excluded")
+        }
+        if !ApplicationScanner.isInvisibleInfo(["LSUIElement": true]) {
+            failures.append("LSUIElement app was accepted")
+        }
+        if !ApplicationScanner.isInvisibleInfo(["LSBackgroundOnly": 1]) {
+            failures.append("LSBackgroundOnly app was accepted")
+        }
+        if ApplicationScanner.isInvisibleInfo(["CFBundleName": "Safari"]) {
+            failures.append("visible app info was treated as invisible")
+        }
+        if let safariURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari"),
+           ApplicationScanner.shouldInclude(url: safariURL) {
+            let scanned = ApplicationScanner.visibleApplications(excluding: [])
+            if !scanned.contains(where: { $0.bundleIdentifier == "com.apple.Safari" }) {
+                failures.append("installed Safari was not scanned")
+            }
+            if ApplicationScanner.visibleApplications(excluding: ["com.apple.Safari"])
+                .contains(where: { $0.bundleIdentifier == "com.apple.Safari" }) {
+                failures.append("excluded bundle was not filtered")
+            }
+        }
+    }
+
+    private static func checkConfirmedShortcuts(_ failures: inout [String]) {
+        if !ConfirmedAppShortcuts.entries(for: "com.unknown.madeup").isEmpty {
+            failures.append("unknown app shortcuts were invented")
+        }
+        if ConfirmedAppShortcuts.entries(for: "com.google.Chrome").isEmpty {
+            failures.append("confirmed Chrome shortcuts were missing")
+        }
+        if ConfirmedAppShortcuts.entries(for: "com.openai.codex").isEmpty {
+            failures.append("confirmed Codex shortcuts were missing")
+        }
     }
 
     private static func checkLaunchPolicy(_ failures: inout [String]) {
@@ -2152,14 +2777,48 @@ private enum SelfTest {
     }
 
     private static func checkRevealPolicy(_ failures: inout [String]) {
-        if !RevealPolicy.shouldHideImmediately(targetIsFrontmost: true) {
-            failures.append("frontmost app was not hidden immediately")
+        if !RevealPolicy.shouldHideImmediately(targetIsFrontmost: true, onScreenWindowCount: 1) {
+            failures.append("frontmost app with a visible window was not hidden immediately")
+        }
+        if RevealPolicy.shouldHideImmediately(targetIsFrontmost: true, onScreenWindowCount: 0) {
+            failures.append("frontmost app without an on-screen window was hidden instead of reopened")
         }
         if !RevealPolicy.shouldReopen(windowCount: 0) {
             failures.append("windowless running app did not use application reopen")
         }
         if RevealPolicy.shouldReopen(windowCount: 1) {
             failures.append("visible app was reopened unnecessarily")
+        }
+    }
+
+    private static func checkWindowPresence(_ failures: inout [String]) {
+        let pid: pid_t = 4242
+        let usable: [String: Any] = [
+            kCGWindowOwnerPID as String: pid,
+            kCGWindowLayer as String: 0,
+            kCGWindowBounds as String: ["Width": CGFloat(800), "Height": CGFloat(600)]
+        ]
+        let tiny: [String: Any] = [
+            kCGWindowOwnerPID as String: pid,
+            kCGWindowLayer as String: 0,
+            kCGWindowBounds as String: ["Width": CGFloat(16), "Height": CGFloat(16)]
+        ]
+        let menuLayer: [String: Any] = [
+            kCGWindowOwnerPID as String: pid,
+            kCGWindowLayer as String: 25,
+            kCGWindowBounds as String: ["Width": CGFloat(800), "Height": CGFloat(600)]
+        ]
+        if !WindowPresence.isUsableWindow(usable, pid: pid) {
+            failures.append("on-screen app window was ignored")
+        }
+        if WindowPresence.isUsableWindow(tiny, pid: pid) {
+            failures.append("tiny helper surface was treated as a usable window")
+        }
+        if WindowPresence.isUsableWindow(menuLayer, pid: pid) {
+            failures.append("menu/status surface was treated as a usable window")
+        }
+        if WindowPresence.isUsableWindow(usable, pid: pid + 1) {
+            failures.append("another process window was attributed to the target")
         }
     }
 

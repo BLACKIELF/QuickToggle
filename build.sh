@@ -26,9 +26,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>QuickToggle</string>
   <key>CFBundleDisplayName</key><string>轻唤</string>
   <key>CFBundleIdentifier</key><string>com.quicktoggle.app</string>
-  <key>CFBundleVersion</key><string>3</string>
-  <key>CFBundleShortVersionString</key><string>0.0.3</string>
-  <key>CFBundleGetInfoString</key><string>QuickToggle（轻唤）0.0.3</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>0.0.4</string>
+  <key>CFBundleGetInfoString</key><string>QuickToggle（轻唤）0.0.4</string>
   <key>CFBundleExecutable</key><string>QuickToggle</string>
   <key>CFBundleIconFile</key><string>QuickToggleIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
