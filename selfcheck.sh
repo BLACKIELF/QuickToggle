@@ -8,7 +8,7 @@ TMP="$(mktemp -d)"
 PID=""
 trap 'if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
-echo "=== QuickToggle（轻唤）0.0.4 自检 ==="
+echo "=== QuickToggle（轻唤）0.0.5 自检 ==="
 bash "$DIR/build.sh"
 /usr/bin/codesign --verify --deep --strict "$APP"
 "$BIN" --self-test

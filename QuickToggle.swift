@@ -155,6 +155,7 @@ private final class PreferenceStore {
         static let enabled = "quickToggle.enabled"
         static let launchIfNeeded = "quickToggle.launchIfNeeded"
         static let importedVerifiedLaunchIDs = "quickToggle.importedVerifiedLaunchIDs"
+        static let importedSuggestedAppIDs = "quickToggle.importedSuggestedAppIDs"
     }
 
     private let defaults: UserDefaults
@@ -207,6 +208,11 @@ private final class PreferenceStore {
     var importedVerifiedLaunchIDs: [String] {
         get { defaults.stringArray(forKey: Key.importedVerifiedLaunchIDs) ?? [] }
         set { defaults.set(newValue, forKey: Key.importedVerifiedLaunchIDs) }
+    }
+
+    var importedSuggestedAppIDs: [String] {
+        get { defaults.stringArray(forKey: Key.importedSuggestedAppIDs) ?? [] }
+        set { defaults.set(newValue, forKey: Key.importedSuggestedAppIDs) }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
@@ -423,7 +429,86 @@ private enum ApplicationScanner {
     }
 }
 
+private enum OccupiedHotKeys {
+    static let entries: [(name: String, shortcut: Shortcut)] = [
+        (
+            "Aident",
+            Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey), label: "1")
+        ),
+        (
+            "Wi‑Fi 菜单",
+            Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey), label: "2")
+        ),
+        (
+            "微信",
+            Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
+        )
+    ]
+
+    static var summary: String {
+        let body = entries.map { "\($0.name) \($0.shortcut.displayName)" }.joined(separator: "，")
+        return "本机已占用：\(body)。不要再录进轻唤。"
+    }
+
+    static func owner(of shortcut: Shortcut) -> String? {
+        entries.first { $0.shortcut == shortcut }?.name
+    }
+}
+
+private enum ShortcutProbe {
+    enum Verdict: Equatable {
+        case ready
+        case invalid(String)
+        case missingApp(String)
+        case usedByQuickToggle
+        case occupiedLocally(String)
+    }
+
+    static func appIsPresent(bundleIdentifier: String, path: String) -> Bool {
+        if FileManager.default.fileExists(atPath: path) { return true }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func inspect(
+        _ shortcut: Shortcut,
+        appName: String? = nil,
+        bundleIdentifier: String? = nil,
+        path: String? = nil,
+        bindings: [AppBinding],
+        excluding: UUID,
+        asSettings: Bool
+    ) -> Verdict {
+        if !asSettings, let bundleIdentifier, let path,
+           !appIsPresent(bundleIdentifier: bundleIdentifier, path: path) {
+            return .missingApp(appName ?? "目标应用")
+        }
+        if asSettings {
+            if let error = shortcut.settingsValidationError { return .invalid(error) }
+        } else if let error = shortcut.validationError {
+            return .invalid(error)
+        }
+        if shortcutIsUsed(shortcut, in: bindings, excluding: excluding) {
+            return .usedByQuickToggle
+        }
+        if let owner = OccupiedHotKeys.owner(of: shortcut) {
+            return .occupiedLocally(owner)
+        }
+        return .ready
+    }
+}
+
 private enum ConfirmedAppShortcuts {
+    static let catalog: [(bundleIdentifier: String, name: String)] = [
+        ("com.tencent.xinWeChat", "微信"),
+        ("com.openai.codex", "Codex"),
+        ("com.google.Chrome", "Chrome"),
+        ("com.apple.Safari", "Safari"),
+        ("com.apple.Terminal", "终端")
+    ]
+
     static func entries(for bundleIdentifier: String) -> [(String, String)] {
         switch bundleIdentifier {
         case "com.tencent.xinWeChat":
@@ -432,6 +517,10 @@ private enum ConfirmedAppShortcuts {
             return [("命令菜单", "⌘ K"), ("新建对话", "⌘ N")]
         case "com.google.Chrome":
             return [("定位地址栏", "⌘ L"), ("重开关闭标签", "⇧⌘ T")]
+        case "com.apple.Safari":
+            return [("打开位置", "⌘ L"), ("新建标签页", "⌘ T")]
+        case "com.apple.Terminal":
+            return [("新建窗口", "⌘ N"), ("新建标签页", "⌘ T")]
         default:
             return []
         }
@@ -453,6 +542,57 @@ private enum VerifiedLaunchHotKeys {
                 keyCode: UInt32(kVK_ANSI_W),
                 modifiers: UInt32(cmdKey | shiftKey),
                 label: "W"
+            )
+        )
+    ]
+
+    static func shortcut(for bundleIdentifier: String) -> Shortcut? {
+        all.first { $0.bundleIdentifier == bundleIdentifier }?.shortcut
+    }
+}
+
+private struct SuggestedToggleApp {
+    let bundleIdentifier: String
+    let name: String
+    let shortcut: Shortcut
+}
+
+private enum SuggestedToggleApps {
+    static let all: [SuggestedToggleApp] = [
+        SuggestedToggleApp(
+            bundleIdentifier: "com.apple.ActivityMonitor",
+            name: "活动监视器",
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_A),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "A"
+            )
+        ),
+        SuggestedToggleApp(
+            bundleIdentifier: "com.apple.Terminal",
+            name: "终端",
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_T),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "T"
+            )
+        ),
+        SuggestedToggleApp(
+            bundleIdentifier: "nl.syncfactory.Hedge.Mac",
+            name: "OffShoot",
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_O),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "O"
+            )
+        ),
+        SuggestedToggleApp(
+            bundleIdentifier: "com.bytedance.macos.feishu",
+            name: "飞书",
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_F),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "F"
             )
         )
     ]
@@ -1566,6 +1706,7 @@ private final class QuickToggleModel {
             isEnabled = store.enabled
             settingsShortcut = store.settingsShortcut ?? Self.defaultSettingsShortcut
             importVerifiedLaunchApps()
+            importSuggestedToggleApps()
         }
 
         settingsHotKey.onPress = { [weak self] in self?.onSettingsHotKey?() }
@@ -1629,34 +1770,51 @@ private final class QuickToggleModel {
 
     func applyShortcut(_ candidate: Shortcut, for bindingID: UUID) -> Bool {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return false }
-        if let error = candidate.validationError {
+        let binding = bindings[index]
+        switch ShortcutProbe.inspect(
+            candidate,
+            appName: binding.target.name,
+            bundleIdentifier: binding.target.bundleIdentifier,
+            path: binding.target.path,
+            bindings: bindings,
+            excluding: bindingID,
+            asSettings: false
+        ) {
+        case .invalid(let error):
             reportStatus(error, tone: .error)
             return false
-        }
-        if shortcutIsUsed(candidate, in: bindings, excluding: bindingID) {
-            reportStatus("该组合已用于其他应用，原快捷键仍然有效。", tone: .warning)
+        case .missingApp(let name):
+            reportStatus("已探测：找不到 \(name)。未改键。", tone: .error)
             return false
+        case .usedByQuickToggle:
+            reportStatus("已探测：该组合已用于轻唤其他应用。原快捷键仍然有效。", tone: .warning)
+            return false
+        case .occupiedLocally(let owner):
+            reportStatus("已探测：占用（\(owner)）。未改键。", tone: .warning)
+            return false
+        case .ready:
+            break
         }
 
         let manager = hotKeyManager(for: bindingID)
         let result = isEnabled ? manager.replace(with: candidate) : manager.probe(candidate)
         switch result {
         case .failure(.occupied):
-            reportStatus("该组合已被其他应用或轻唤中的其他目标占用，原快捷键仍然有效。", tone: .warning)
+            reportStatus("已探测：系统占用。原快捷键仍然有效。", tone: .warning)
             return false
         case .failure(.failed):
-            reportStatus("系统无法注册该组合，原快捷键仍然有效。", tone: .error)
+            reportStatus("已探测：系统无法注册该组合。原快捷键仍然有效。", tone: .error)
             return false
         case .success:
             bindings[index].shortcut = candidate
             saveBindings()
             if let warning = candidate.riskWarning {
-                reportStatus(warning, tone: .warning)
+                reportStatus("已探测：空闲。\(warning)", tone: .warning)
             } else {
                 reportStatus(
                     isEnabled
-                        ? "\(bindings[index].target.name) 的快捷键已立即生效。"
-                        : "快捷键已保存，当前全部停用。"
+                        ? "已探测：空闲。\(bindings[index].target.name) \(candidate.displayName) 已立即生效。"
+                        : "已探测：空闲。快捷键已保存，当前全部停用。"
                 )
             }
             return true
@@ -1664,29 +1822,42 @@ private final class QuickToggleModel {
     }
 
     func applySettingsShortcut(_ candidate: Shortcut) -> Bool {
-        if let error = candidate.settingsValidationError {
+        switch ShortcutProbe.inspect(
+            candidate,
+            bindings: bindings,
+            excluding: UUID(),
+            asSettings: true
+        ) {
+        case .invalid(let error):
             reportStatus(error, tone: .error)
             return false
-        }
-        if bindings.contains(where: { $0.shortcut == candidate }) {
-            reportStatus("该组合已用于应用快捷键，原设置快捷键仍然有效。", tone: .warning)
+        case .missingApp:
+            reportStatus("已探测：找不到设置窗口。未改键。", tone: .error)
             return false
+        case .usedByQuickToggle:
+            reportStatus("已探测：该组合已用于应用快捷键。原设置快捷键仍然有效。", tone: .warning)
+            return false
+        case .occupiedLocally(let owner):
+            reportStatus("已探测：占用（\(owner)）。原设置快捷键仍然有效。", tone: .warning)
+            return false
+        case .ready:
+            break
         }
 
         switch settingsHotKey.replace(with: candidate) {
         case .failure(.occupied):
-            reportStatus("该组合已被其他应用占用，原设置快捷键仍然有效。", tone: .warning)
+            reportStatus("已探测：系统占用。原设置快捷键仍然有效。", tone: .warning)
             return false
         case .failure(.failed):
-            reportStatus("系统无法注册该组合，原设置快捷键仍然有效。", tone: .error)
+            reportStatus("已探测：系统无法注册该组合。原设置快捷键仍然有效。", tone: .error)
             return false
         case .success:
             settingsShortcut = candidate
             preferences?.settingsShortcut = candidate
             if let warning = candidate.riskWarning {
-                reportStatus(warning, tone: .warning)
+                reportStatus("已探测：空闲。\(warning)", tone: .warning)
             } else {
-                reportStatus("设置窗口快捷键已改为 \(candidate.displayName)，保存并立即生效。")
+                reportStatus("已探测：空闲。设置窗口快捷键已改为 \(candidate.displayName)，保存并立即生效。")
             }
             return true
         }
@@ -1810,6 +1981,41 @@ private final class QuickToggleModel {
         } else {
             applyStatus(
                 "已加入 \(added.joined(separator: "、"))。\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。",
+                tone: .warning
+            )
+        }
+    }
+
+    private func importSuggestedToggleApps() {
+        guard let preferences else { return }
+        var imported = Set(preferences.importedSuggestedAppIDs)
+        var added: [String] = []
+        var occupied: [String] = []
+        for item in SuggestedToggleApps.all {
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: item.bundleIdentifier)
+            guard let url, FileManager.default.fileExists(atPath: url.path) else { continue }
+            if bindings.contains(where: { $0.target.bundleIdentifier == item.bundleIdentifier }) {
+                imported.insert(item.bundleIdentifier)
+                continue
+            }
+            if imported.contains(item.bundleIdentifier) { continue }
+            guard addTarget(url: url) else { continue }
+            imported.insert(item.bundleIdentifier)
+            added.append("\(item.name) \(item.shortcut.displayName)")
+            guard let bindingID = bindings.first(where: { $0.target.bundleIdentifier == item.bundleIdentifier })?.id else {
+                continue
+            }
+            if !applyShortcut(item.shortcut, for: bindingID) {
+                occupied.append("\(item.name) \(item.shortcut.displayName)")
+            }
+        }
+        preferences.importedSuggestedAppIDs = Array(imported).sorted()
+        if added.isEmpty { return }
+        if occupied.isEmpty {
+            applyStatus("已加入 \(added.joined(separator: "、"))，保存并立即生效。", tone: .info)
+        } else {
+            applyStatus(
+                "已加入应用，但 \(occupied.joined(separator: "、")) 被占用，请在本行改成其他组合。",
                 tone: .warning
             )
         }
@@ -2117,10 +2323,11 @@ private final class SettingsController: NSObject {
     private let accentRail = AccentRailView(frame: .zero)
     private var guideAccentIcons: [NSImageView] = []
     private var lastRenderedBindings: [AppBinding]?
+    private var guideExpanded = false
+    private var appGuideExpanded = false
     private var colorTheme = ColorTheme.aurora
     private let helpPopover = NSPopover()
     private let addPopover = NSPopover()
-    private let referencePopover = NSPopover()
     private let pendingPicker = PendingApplicationPickerController()
 
     init(model: QuickToggleModel) {
@@ -2285,7 +2492,7 @@ private final class SettingsController: NSObject {
         listScroll.drawsBackground = false
         listScroll.setContentHuggingPriority(.init(1), for: .vertical)
         listScroll.setContentCompressionResistancePriority(.init(1), for: .vertical)
-        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 168).isActive = true
 
         statusDot.widthAnchor.constraint(equalToConstant: 10).isActive = true
         statusDot.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -2389,7 +2596,7 @@ private final class SettingsController: NSObject {
         [shortcutGrid, nativeNote, customGuide].forEach {
             $0.widthAnchor.constraint(equalTo: guideContent.widthAnchor).isActive = true
         }
-        guideCard.frame = NSRect(x: 0, y: 0, width: 560, height: 168)
+        guideCard.heightAnchor.constraint(equalToConstant: 168).isActive = true
         guideCard.setAccessibilityLabel("macOS 原生快捷键指南")
         pin(guideContent, inside: guideCard, insets: NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18))
 
@@ -2405,11 +2612,7 @@ private final class SettingsController: NSObject {
         appGuideButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
         appGuideButton.setAccessibilityLabel("展开或收起应用内快捷键")
 
-        let applicationRows = [
-            ("com.tencent.xinWeChat", "微信"),
-            ("com.openai.codex", "Codex"),
-            ("com.google.Chrome", "Chrome")
-        ].compactMap { identifier, name in
+        let applicationRows = ConfirmedAppShortcuts.catalog.compactMap { identifier, name in
             makeApplicationShortcutRow(
                 bundleIdentifier: identifier,
                 name: name,
@@ -2426,24 +2629,47 @@ private final class SettingsController: NSObject {
             applicationList = verticalStack(applicationRows, spacing: 8)
         }
 
+        let occupiedNote = NSTextField(wrappingLabelWithString: OccupiedHotKeys.summary)
+        occupiedNote.font = .systemFont(ofSize: 11.5, weight: .medium)
+        occupiedNote.textColor = .secondaryLabelColor
+        occupiedNote.maximumNumberOfLines = 2
+
         let applicationNote = NSTextField(wrappingLabelWithString:
-            "这些快捷键由对应应用提供，轻唤不会注册、修改或覆盖。可能因应用版本、语言或个人设置不同，请以应用菜单与设置为准。"
+            "只收录本机核实过的项，避免和轻唤热键撞车。未列出的请看应用菜单，不要猜测。"
         )
         applicationNote.font = .systemFont(ofSize: 11.5)
         applicationNote.textColor = .secondaryLabelColor
         applicationNote.maximumNumberOfLines = 2
 
-        let applicationGuideContent = verticalStack([applicationList, applicationNote], spacing: 10)
-        [applicationList, applicationNote].forEach {
+        let applicationGuideContent = verticalStack(
+            [occupiedNote, applicationList, applicationNote],
+            spacing: 10
+        )
+        [occupiedNote, applicationList, applicationNote].forEach {
             $0.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         }
-        appGuideCard.frame = NSRect(x: 0, y: 0, width: 560, height: 148)
+        appGuideCard.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        appGuideCard.isHidden = true
+        guideCard.isHidden = true
         appGuideCard.setAccessibilityLabel("已安装应用的快捷键参考")
+        let appGuideScroll = NSScrollView()
+        appGuideScroll.drawsBackground = false
+        appGuideScroll.hasVerticalScroller = true
+        appGuideScroll.autohidesScrollers = true
+        appGuideScroll.borderType = .noBorder
+        appGuideScroll.documentView = applicationGuideContent
         pin(
-            applicationGuideContent,
+            appGuideScroll,
             inside: appGuideCard,
-            insets: NSEdgeInsets(top: 12, left: 18, bottom: 12, right: 18)
+            insets: NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 8)
         )
+        applicationGuideContent.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            applicationGuideContent.leadingAnchor.constraint(equalTo: appGuideScroll.contentView.leadingAnchor),
+            applicationGuideContent.trailingAnchor.constraint(equalTo: appGuideScroll.contentView.trailingAnchor),
+            applicationGuideContent.topAnchor.constraint(equalTo: appGuideScroll.contentView.topAnchor),
+            applicationGuideContent.widthAnchor.constraint(equalTo: appGuideScroll.contentView.widthAnchor, constant: -8)
+        ])
 
         pendingPicker.onPick = { [weak self] url in
             self?.addPopover.performClose(nil)
@@ -2456,12 +2682,11 @@ private final class SettingsController: NSObject {
         addPopover.contentViewController = pendingPicker
         addPopover.behavior = .transient
         helpPopover.behavior = .transient
-        referencePopover.behavior = .transient
         applyColorTheme(rebuildRows: false)
         applyAccessibilityChrome()
 
         let rootStack = verticalStack(
-            [header, applicationsCard, permissionRow, loginButton, guideButton, appGuideButton],
+            [header, applicationsCard, permissionRow, loginButton, guideButton, guideCard, appGuideButton, appGuideCard],
             spacing: 10
         )
         rootStack.translatesAutoresizingMaskIntoConstraints = false
@@ -2480,7 +2705,9 @@ private final class SettingsController: NSObject {
             permissionRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             loginButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             guideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
+            guideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            appGuideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
         ])
         window.initialFirstResponder = addButton
     }
@@ -2488,7 +2715,6 @@ private final class SettingsController: NSObject {
     private func rebuildBindingRows() {
         helpPopover.performClose(nil)
         addPopover.performClose(nil)
-        referencePopover.performClose(nil)
         bindingsStack.arrangedSubviews.forEach {
             bindingsStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
@@ -2567,6 +2793,8 @@ private final class SettingsController: NSObject {
         recorder.setAccessibilityLabel("\(binding.target.name) 快捷键录制")
         if let native = VerifiedLaunchHotKeys.shortcut(for: binding.target.bundleIdentifier) {
             recorder.toolTip = "应用自带 \(native.displayName)。点此改成轻唤热键，改完立即生效。"
+        } else if let recommended = SuggestedToggleApps.shortcut(for: binding.target.bundleIdentifier) {
+            recorder.toolTip = "推荐 \(recommended.displayName)。点此录制或改键，改完立即生效。"
         } else {
             recorder.toolTip = "推荐 ⌘0–9、⌘⌥K、⌘⇧K、⌃⇧K；冲突时保留原快捷键"
         }
@@ -2805,25 +3033,29 @@ private final class SettingsController: NSObject {
     }
 
     @objc private func toggleGuide() {
-        showReferencePopover(guideCard, from: guideButton)
+        guideExpanded.toggle()
+        if guideExpanded { appGuideExpanded = false }
+        updateGuideVisibility()
     }
 
     @objc private func toggleAppGuide() {
-        showReferencePopover(appGuideCard, from: appGuideButton)
+        appGuideExpanded.toggle()
+        if appGuideExpanded { guideExpanded = false }
+        updateGuideVisibility()
     }
 
-    private func showReferencePopover(_ card: NSView, from button: NSButton) {
-        if referencePopover.isShown,
-           referencePopover.contentViewController?.view === card {
-            referencePopover.performClose(nil)
-            return
-        }
-        card.removeFromSuperview()
-        let controller = NSViewController()
-        controller.view = card
-        referencePopover.contentViewController = controller
-        referencePopover.contentSize = card.frame.size
-        referencePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    private func updateGuideVisibility() {
+        guideCard.isHidden = !guideExpanded
+        appGuideCard.isHidden = !appGuideExpanded
+        guideButton.image = NSImage(
+            systemSymbolName: guideExpanded ? "chevron.down" : "chevron.right",
+            accessibilityDescription: nil
+        )
+        appGuideButton.image = NSImage(
+            systemSymbolName: appGuideExpanded ? "chevron.down" : "chevron.right",
+            accessibilityDescription: nil
+        )
+        window.recalculateKeyViewLoop()
     }
 }
 // MARK: - Menu bar application
@@ -3259,6 +3491,121 @@ private enum SelfTest {
         }
         if VerifiedLaunchHotKeys.shortcut(for: "com.unknown.madeup") != nil {
             failures.append("unverified launch shortcut was invented")
+        }
+        if VerifiedLaunchHotKeys.shortcut(for: "com.apple.ActivityMonitor") != nil
+            || VerifiedLaunchHotKeys.shortcut(for: "com.apple.Terminal") != nil {
+            failures.append("utility apps were given invented native launch shortcuts")
+        }
+        let activity = SuggestedToggleApps.shortcut(for: "com.apple.ActivityMonitor")
+        let terminal = SuggestedToggleApps.shortcut(for: "com.apple.Terminal")
+        if activity?.displayName != "⇧⌘A" {
+            failures.append("Activity Monitor suggested shortcut was not ⇧⌘A")
+        }
+        if terminal?.displayName != "⇧⌘T" {
+            failures.append("Terminal suggested shortcut was not ⇧⌘T")
+        }
+        let offshoot = SuggestedToggleApps.shortcut(for: "nl.syncfactory.Hedge.Mac")
+        if offshoot?.displayName != "⇧⌘O" {
+            failures.append("OffShoot suggested shortcut was not ⇧⌘O")
+        }
+        let feishu = SuggestedToggleApps.shortcut(for: "com.bytedance.macos.feishu")
+        if feishu?.displayName != "⇧⌘F" {
+            failures.append("Feishu suggested shortcut was not ⇧⌘F")
+        }
+        if !ConfirmedAppShortcuts.entries(for: "com.bytedance.macos.feishu").isEmpty {
+            failures.append("Feishu in-app shortcuts were invented")
+        }
+        if SuggestedToggleApps.shortcut(for: "com.unknown.madeup") != nil {
+            failures.append("unrequested suggested shortcut was invented")
+        }
+        if ConfirmedAppShortcuts.entries(for: "com.apple.Safari").isEmpty {
+            failures.append("confirmed Safari shortcuts were missing")
+        }
+        if ConfirmedAppShortcuts.entries(for: "com.apple.Terminal").isEmpty {
+            failures.append("confirmed Terminal shortcuts were missing")
+        }
+        if !ConfirmedAppShortcuts.entries(for: "com.apple.ActivityMonitor").isEmpty {
+            failures.append("Activity Monitor in-app shortcuts were invented")
+        }
+        if !OccupiedHotKeys.summary.contains("Aident ⌘1") || !OccupiedHotKeys.summary.contains("Wi‑Fi") {
+            failures.append("occupied hotkey summary lost verified local conflicts")
+        }
+        checkShortcutProbe(&failures)
+    }
+
+    private static func checkShortcutProbe(_ failures: inout [String]) {
+        let commandOne = Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey), label: "1")
+        let commandTwo = Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey), label: "2")
+        let wechat = Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
+        let feishu = Shortcut(keyCode: UInt32(kVK_ANSI_F), modifiers: UInt32(cmdKey | shiftKey), label: "F")
+        if OccupiedHotKeys.owner(of: commandOne) != "Aident" {
+            failures.append("⌘1 was not flagged as Aident")
+        }
+        if OccupiedHotKeys.owner(of: commandTwo) != "Wi‑Fi 菜单" {
+            failures.append("⌘2 was not flagged as Wi-Fi menu")
+        }
+        if OccupiedHotKeys.owner(of: wechat) != "微信" {
+            failures.append("⇧⌘W was not flagged as WeChat")
+        }
+        if OccupiedHotKeys.owner(of: feishu) != nil {
+            failures.append("⇧⌘F was treated as locally occupied")
+        }
+
+        let boundID = UUID()
+        let bound = AppBinding(
+            id: boundID,
+            target: TargetApplication(bundleIdentifier: "test.one", name: "One", path: "/One.app"),
+            shortcut: feishu,
+            launchIfNeeded: true
+        )
+        let aident = ShortcutProbe.inspect(
+            commandOne,
+            appName: "One",
+            bundleIdentifier: "com.apple.Safari",
+            path: "/Applications/Safari.app",
+            bindings: [bound],
+            excluding: UUID(),
+            asSettings: false
+        )
+        if aident != .occupiedLocally("Aident") {
+            failures.append("shortcut probe missed Aident occupancy")
+        }
+        let duplicate = ShortcutProbe.inspect(
+            feishu,
+            appName: "Two",
+            bundleIdentifier: "com.apple.Safari",
+            path: "/Applications/Safari.app",
+            bindings: [bound],
+            excluding: UUID(),
+            asSettings: false
+        )
+        if duplicate != .usedByQuickToggle {
+            failures.append("shortcut probe missed an in-app duplicate")
+        }
+        let missing = ShortcutProbe.inspect(
+            feishu,
+            appName: "Missing",
+            bundleIdentifier: "com.quicktoggle.missing.app",
+            path: "/Applications/DoesNotExist.app",
+            bindings: [],
+            excluding: UUID(),
+            asSettings: false
+        )
+        if case .missingApp = missing {
+        } else {
+            failures.append("shortcut probe missed a missing app")
+        }
+        let ready = ShortcutProbe.inspect(
+            feishu,
+            appName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            path: "/Applications/Safari.app",
+            bindings: [bound],
+            excluding: boundID,
+            asSettings: false
+        )
+        if ready != .ready {
+            failures.append("free shortcut was not ready after local probe")
         }
     }
 
