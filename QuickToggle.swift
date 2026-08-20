@@ -462,23 +462,162 @@ private enum VerifiedLaunchHotKeys {
     }
 }
 
+private enum IconNormalizer {
+    static let contentInsetRatio: CGFloat = 0.04
+
+    static func drawingRect(content: NSSize, canvas: NSSize) -> NSRect {
+        let side = min(canvas.width, canvas.height)
+        let inset = max(side * contentInsetRatio, 0.5)
+        let target = NSRect(
+            x: inset,
+            y: inset,
+            width: canvas.width - inset * 2,
+            height: canvas.height - inset * 2
+        )
+        let scale = min(
+            target.width / max(content.width, 1),
+            target.height / max(content.height, 1)
+        )
+        let draw = NSSize(width: content.width * scale, height: content.height * scale)
+        return NSRect(
+            x: target.midX - draw.width / 2,
+            y: target.midY - draw.height / 2,
+            width: draw.width,
+            height: draw.height
+        )
+    }
+
+    static func image(at path: String, pointSize: CGFloat) -> NSImage {
+        let source = NSWorkspace.shared.icon(forFile: path)
+        let canvas = NSSize(width: pointSize, height: pointSize)
+        let samplePixels = 128
+        source.size = NSSize(width: samplePixels, height: samplePixels)
+        guard let raster = rasterized(source, pixels: samplePixels),
+              let bounds = opaqueBounds(in: raster),
+              let cgImage = raster.cgImage,
+              let cropped = cgImage.cropping(to: bounds) else {
+            return draw(source, into: canvas, content: NSSize(width: samplePixels, height: samplePixels))
+        }
+        let croppedImage = NSImage(
+            cgImage: cropped,
+            size: NSSize(width: bounds.width, height: bounds.height)
+        )
+        return draw(croppedImage, into: canvas, content: croppedImage.size)
+    }
+
+    private static func rasterized(_ image: NSImage, pixels: Int) -> NSBitmapImageRep? {
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixels,
+            pixelsHigh: pixels,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = NSSize(width: pixels, height: pixels)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.current = context
+        context.imageInterpolation = .high
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: pixels, height: pixels),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        return rep
+    }
+
+    private static func opaqueBounds(in rep: NSBitmapImageRep, alphaLimit: CGFloat = 0.18) -> CGRect? {
+        let width = rep.pixelsWide
+        let height = rep.pixelsHigh
+        var minX = width
+        var minY = height
+        var maxX = 0
+        var maxY = 0
+        var found = false
+        for y in 0..<height {
+            for x in 0..<width {
+                guard let color = rep.colorAt(x: x, y: y), color.alphaComponent >= alphaLimit else {
+                    continue
+                }
+                found = true
+                if x < minX { minX = x }
+                if y < minY { minY = y }
+                if x > maxX { maxX = x }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard found else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    private static func draw(_ image: NSImage, into canvas: NSSize, content: NSSize) -> NSImage {
+        let dest = drawingRect(content: content, canvas: canvas)
+        let pixelsWide = max(Int((canvas.width * 2).rounded()), 1)
+        let pixelsHigh = max(Int((canvas.height * 2).rounded()), 1)
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelsWide,
+            pixelsHigh: pixelsHigh,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return drawLegacy(image, into: canvas, dest: dest)
+        }
+        rep.size = canvas
+        NSGraphicsContext.saveGraphicsState()
+        if let context = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.current = context
+            context.imageInterpolation = .high
+            NSColor.clear.setFill()
+            NSRect(origin: .zero, size: canvas).fill()
+            image.draw(
+                in: dest,
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let output = NSImage(size: canvas)
+        output.addRepresentation(rep)
+        output.isTemplate = false
+        return output
+    }
+
+    private static func drawLegacy(_ image: NSImage, into canvas: NSSize, dest: NSRect) -> NSImage {
+        let output = NSImage(size: canvas)
+        output.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .high
+        image.draw(
+            in: dest,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1,
+            respectFlipped: true,
+            hints: [.interpolation: NSImageInterpolation.high]
+        )
+        output.unlockFocus()
+        output.isTemplate = false
+        return output
+    }
+}
+
 private func sizedApplicationIcon(at path: String, pointSize: CGFloat) -> NSImage {
-    let source = NSWorkspace.shared.icon(forFile: path)
-    let canvas = NSSize(width: pointSize, height: pointSize)
-    let output = NSImage(size: canvas)
-    output.lockFocus()
-    NSGraphicsContext.current?.imageInterpolation = .high
-    source.draw(
-        in: NSRect(origin: .zero, size: canvas),
-        from: .zero,
-        operation: .sourceOver,
-        fraction: 1,
-        respectFlipped: true,
-        hints: [.interpolation: NSImageInterpolation.high]
-    )
-    output.unlockFocus()
-    output.isTemplate = false
-    return output
+    IconNormalizer.image(at: path, pointSize: pointSize)
 }
 
 private enum BindingHelpContent {
@@ -2388,7 +2527,7 @@ private final class SettingsController: NSObject {
 
         let icon = NSImageView()
         icon.image = sizedApplicationIcon(at: binding.target.path, pointSize: 32)
-        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.imageScaling = .scaleNone
         icon.widthAnchor.constraint(equalToConstant: 32).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 32).isActive = true
         icon.setAccessibilityLabel("\(binding.target.name) 图标")
@@ -2509,10 +2648,10 @@ private final class SettingsController: NSObject {
         ) else { return nil }
 
         let icon = NSImageView()
-        icon.image = sizedApplicationIcon(at: applicationURL.path, pointSize: 28)
-        icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.image = sizedApplicationIcon(at: applicationURL.path, pointSize: 32)
+        icon.imageScaling = .scaleNone
+        icon.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 32).isActive = true
         icon.setAccessibilityLabel("\(name) 图标")
 
         let appName = NSTextField(labelWithString: name)
@@ -2532,7 +2671,11 @@ private final class SettingsController: NSObject {
             tip.setAccessibilityLabel("\(name)，\(action)，\(keys)")
             return tip
         }
-        let tips = horizontalStack(tipViews, spacing: 18)
+        var columns = tipViews
+        if columns.count == 1 {
+            columns.append(NSView())
+        }
+        let tips = horizontalStack(columns, spacing: 18)
         tips.distribution = .fillEqually
         let row = horizontalStack([icon, appName, tips], spacing: 10)
         row.alignment = .centerY
@@ -2916,6 +3059,7 @@ private enum SelfTest {
         checkConfirmedShortcuts(&failures)
         checkStatusPolicy(&failures)
         checkLoginAtLaunch(&failures)
+        checkIconNormalizer(&failures)
 
         if failures.isEmpty {
             print("QuickToggle self-test passed")
@@ -3307,6 +3451,50 @@ private enum SelfTest {
         }
         if LoginAtLaunch.status != .off && LoginAtLaunch.status != .needsApproval && LoginAtLaunch.status != .unavailable {
             failures.append("unexpected login item status \(String(describing: LoginAtLaunch.status))")
+        }
+    }
+
+    private static func checkIconNormalizer(_ failures: inout [String]) {
+        let canvas = NSSize(width: 32, height: 32)
+        let fullBleed = IconNormalizer.drawingRect(
+            content: NSSize(width: 128, height: 128),
+            canvas: canvas
+        )
+        let padded = IconNormalizer.drawingRect(
+            content: NSSize(width: 88, height: 88),
+            canvas: canvas
+        )
+        if abs(fullBleed.width - padded.width) > 0.01 || abs(fullBleed.height - padded.height) > 0.01 {
+            failures.append("padded app icon did not fill the same square as a full-bleed icon")
+        }
+        let expected = 32 - 32 * IconNormalizer.contentInsetRatio * 2
+        if abs(fullBleed.width - expected) > 0.05 {
+            failures.append("normalized icon did not fill the inset square")
+        }
+
+        let samples: [(String, String)] = [
+            ("wechat", "/Applications/WeChat.app"),
+            ("chrome", "/Applications/Google Chrome.app"),
+            ("codex", "/Applications/ChatGPT.app"),
+            ("grok", "/Applications/Grok.app"),
+            ("gemini", "/Applications/Gemini.app")
+        ]
+        var dumpDir: URL?
+        if let raw = ProcessInfo.processInfo.environment["QUICKTOGGLE_DUMP_ICONS"], !raw.isEmpty {
+            dumpDir = URL(fileURLWithPath: raw)
+            try? FileManager.default.createDirectory(at: dumpDir!, withIntermediateDirectories: true)
+        }
+        for (name, path) in samples where FileManager.default.fileExists(atPath: path) {
+            let icon = sizedApplicationIcon(at: path, pointSize: 32)
+            if icon.size != canvas {
+                failures.append("normalized \(name) icon size was \(icon.size)")
+            }
+            if let dumpDir,
+               let tiff = icon.tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: dumpDir.appendingPathComponent("\(name)-32.png"))
+            }
         }
     }
 }
