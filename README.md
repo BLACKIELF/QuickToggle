@@ -4,6 +4,10 @@
 
 当前版本：`0.0.5`
 
+详细说明与示例图见 [`docs/使用说明.md`](docs/使用说明.md)。
+
+![设置页](docs/screenshots/settings-list-clean.png)
+
 ## 下载与运行
 
 - Apple Silicon Mac，macOS 13 或更高版本。
@@ -80,6 +84,9 @@ bash selfcheck.sh
 - `build.sh`：无第三方依赖的 App Bundle 构建。
 - `selfcheck.sh`：构建、自检、冒烟和资源测量。
 - `Assets/QuickToggleIcon-0817v2.icns`：应用图标。
+- `docs/使用说明.md`：中文详细说明。
+- `docs/screenshots/`：设置页示例图。
+- `docs/tweet/`：推文配图。
 
 `build/` 是本机构建结果，不提交到仓库。
 
