@@ -25,10 +25,11 @@ open "build/QuickToggle.app"
 - 每个应用旁有紧凑的 `?` 说明：当前轻唤热键、已确认的少量原生快捷键，以及如何自己查看。无法确认时不会编造。
 - 记住按键前的隐藏、最小化或显示状态，第二次按键尽量安全恢复。
 - 休眠、解锁或点开菜单栏后会自动重新注册快捷键；磁盘上的应用比正在运行的进程更新时会自动重启，不必再手动退出再进。
+- 可选“登录时启动”，默认关闭，只用系统登录项，不新增后台进程。开机后要快捷键继续可用，打开这个开关即可。
 - 新快捷键先注册再替换；发生冲突时旧快捷键继续有效。
 - 设置窗口默认使用 `⌘3` 显示或隐藏，也可以直接重新录制。
 - 无辅助功能权限时仍可激活、隐藏和重新打开窗口；精确恢复最小化窗口需要用户主动授权。
-- 只使用 Swift、AppKit、Carbon 与 ApplicationServices，无第三方依赖、网络请求、遥测或账号系统。
+- 只使用 Swift、AppKit、Carbon、ApplicationServices 与 ServiceManagement，无第三方依赖、网络请求、遥测或账号系统。
 
 ## 使用
 
@@ -40,7 +41,7 @@ open "build/QuickToggle.app"
 4. 每个应用可独立设置“未运行时自动打开”，也可单独移除。
 5. 设置保存后立即生效，并通过 UserDefaults 保存在本机。
 
-菜单栏包含：显示设置、启用/停用全部快捷键、申请辅助功能权限、退出。
+菜单栏包含：显示设置、启用/停用全部快捷键、申请辅助功能权限、退出。设置页底部有默认关闭的“登录时启动”；macOS 原生快捷键和应用内快捷键改为弹出参考，不和主列表抢高度。
 
 ## 两次按键行为
 
@@ -113,10 +114,11 @@ open "build/QuickToggle.app"
 - Scans installed visible apps into an “add app” picker. Helpers and background-only components stay out of the main list, and nothing is registered automatically.
 - Each row has a compact `?` popover for the current QuickToggle hotkey, a few confirmed in-app shortcuts, and how to look them up. Unknown shortcuts are never invented.
 - Remembers whether the app was hidden, minimized, or visible and restores conservatively on the second press.
+- Optional “Open at Login”, off by default, using the system login item only.
 - Transactional hot-key replacement: a conflicting candidate never removes the working shortcut.
 - The settings window defaults to `⌘3` and can be changed in place.
 - Activation, hiding, and window reopening work without Accessibility access; exact minimized-window restoration is opt-in.
-- Native Swift, AppKit, Carbon, and ApplicationServices only—no third-party dependencies, network requests, telemetry, login, or sync.
+- Native Swift, AppKit, Carbon, ApplicationServices, and ServiceManagement only—no third-party dependencies, network requests, telemetry, accounts, or sync.
 
 ### How it behaves
 

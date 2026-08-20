@@ -14,7 +14,7 @@ mkdir -p "$BIN" "$RES"
 echo "→ Debug 编译中..."
 /usr/bin/swiftc "$SCRIPT_DIR/QuickToggle.swift" \
   -Onone -g -warnings-as-errors \
-  -framework AppKit -framework Carbon -framework ApplicationServices \
+  -framework AppKit -framework Carbon -framework ApplicationServices -framework ServiceManagement \
   -target "arm64-apple-macosx13.0" \
   -o "$BIN/$APP_NAME"
 

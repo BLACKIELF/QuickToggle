@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import Foundation
+import ServiceManagement
 import UniformTypeIdentifiers
 
 // MARK: - Persisted model
@@ -219,6 +220,87 @@ private final class PreferenceStore {
             return
         }
         defaults.set(data, forKey: key)
+    }
+}
+
+private enum StatusTone: Equatable {
+    case info
+    case warning
+    case error
+
+    var color: NSColor {
+        switch self {
+        case .info: return .secondaryLabelColor
+        case .warning: return .systemOrange
+        case .error: return .systemRed
+        }
+    }
+}
+
+private enum StatusPolicy {
+    static let stickyDuration: TimeInterval = 12
+
+    static func shouldKeepCurrent(
+        current: StatusTone,
+        incoming: StatusTone,
+        stickyUntil: Date,
+        now: Date = Date()
+    ) -> Bool {
+        incoming == .info && current != .info && now < stickyUntil
+    }
+}
+
+private enum LoginItemStatus: Equatable {
+    case off
+    case on
+    case needsApproval
+    case unavailable
+
+    var isOn: Bool { self == .on }
+
+    var helpText: String {
+        switch self {
+        case .on:
+            return "登录后自动运行轻唤，快捷键才会在开机后可用。"
+        case .needsApproval:
+            return "请在“系统设置 > 通用 > 登录项与扩展”中允许轻唤。"
+        case .unavailable:
+            return "当前环境无法使用系统登录项。"
+        case .off:
+            return "默认关闭。打开后由 macOS 在登录时启动，不会新增后台进程。"
+        }
+    }
+}
+
+private enum LoginAtLaunch {
+    static var status: LoginItemStatus {
+        switch SMAppService.mainApp.status {
+        case .enabled: return .on
+        case .requiresApproval: return .needsApproval
+        case .notFound: return .unavailable
+        default: return .off
+        }
+    }
+
+    static func setEnabled(_ enabled: Bool) -> (LoginItemStatus, String?) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else if SMAppService.mainApp.status != .notRegistered {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            return (status, "无法更改登录时启动。")
+        }
+        let next = status
+        switch next {
+        case .on:
+            return (next, nil)
+        case .needsApproval, .unavailable:
+            return (next, next.helpText)
+        case .off:
+            return (next, enabled ? "登录时启动未生效。" : nil)
+        }
     }
 }
 
@@ -1013,7 +1095,7 @@ private enum WindowPresence {
 }
 
 private final class ToggleEngine {
-    var onStatus: ((String) -> Void)?
+    var onStatus: ((String, StatusTone) -> Void)?
     private var session: ToggleSession?
     private var isLaunching = false
     private var launchGeneration = 0
@@ -1024,9 +1106,13 @@ private final class ToggleEngine {
         launchGeneration += 1
     }
 
+    private func say(_ message: String, _ tone: StatusTone = .info) {
+        onStatus?(message, tone)
+    }
+
     func toggle(_ target: TargetApplication, launchIfNeeded: Bool) {
         guard !isLaunching else {
-            onStatus?("目标应用正在启动，请稍候。")
+            say("目标应用正在启动，请稍候。", .warning)
             return
         }
         if let session {
@@ -1043,14 +1129,14 @@ private final class ToggleEngine {
             $0.bundleIdentifier == target.bundleIdentifier
         }
         guard LaunchPolicy.allowsReveal(isRunning: running != nil, launchIfNeeded: launchIfNeeded) else {
-            onStatus?("\(target.name) 尚未运行，自动打开已关闭。")
+            say("\(target.name) 尚未运行，自动打开已关闭。", .warning)
             return
         }
         guard let running else {
             let resolvedURL = workspace.urlForApplication(withBundleIdentifier: target.bundleIdentifier)
                 ?? URL(fileURLWithPath: target.path)
             guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
-                onStatus?("找不到目标应用，请重新选择。")
+                say("找不到目标应用，请重新选择。", .error)
                 return
             }
             let previous = previousFrontmostProcessIdentifier(excluding: nil)
@@ -1063,7 +1149,7 @@ private final class ToggleEngine {
                     guard let self else { return }
                     self.isLaunching = false
                     guard let app, error == nil else {
-                        self.onStatus?("目标应用启动失败。")
+                        self.say("目标应用启动失败。", .error)
                         return
                     }
                     self.session = ToggleSession(
@@ -1073,7 +1159,7 @@ private final class ToggleEngine {
                         createdAt: Date()
                     )
                     _ = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-                    self.onStatus?("已启动并呼出 \(target.name)。")
+                    self.say("已启动并呼出 \(target.name)。")
                 }
             }
             return
@@ -1085,7 +1171,7 @@ private final class ToggleEngine {
         if current.isHidden {
             _ = current.unhide()
             guard current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
-                onStatus?("无法激活目标应用。")
+                say("无法激活目标应用。", .error)
                 return
             }
             if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
@@ -1098,7 +1184,7 @@ private final class ToggleEngine {
                 state: .hidden,
                 createdAt: Date()
             )
-            onStatus?("已呼出 \(target.name)；再次按键会恢复隐藏状态。")
+            say("已呼出 \(target.name)；再次按键会恢复隐藏状态。")
             return
         }
 
@@ -1107,11 +1193,11 @@ private final class ToggleEngine {
             onScreenWindowCount: onScreenWindows
         ) {
             guard current.hide() else {
-                onStatus?("无法隐藏目标应用。")
+                say("无法隐藏目标应用。", .error)
                 return
             }
             activatePrevious(previous)
-            onStatus?("\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。")
+            say("\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。")
             return
         }
 
@@ -1140,7 +1226,7 @@ private final class ToggleEngine {
                     state: .minimized(restoredWindow),
                     createdAt: Date()
                 )
-                onStatus?("已恢复一个最小化窗口；再次按键只会重新最小化这个窗口。")
+                say("已恢复一个最小化窗口；再次按键只会重新最小化这个窗口。")
                 return
             }
         }
@@ -1150,7 +1236,7 @@ private final class ToggleEngine {
             return
         }
         guard current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
-            onStatus?("无法激活目标应用。")
+            say("无法激活目标应用。", .error)
             return
         }
         if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
@@ -1163,7 +1249,7 @@ private final class ToggleEngine {
             state: .visible,
             createdAt: Date()
         )
-        onStatus?("已呼出 \(target.name)；再次按键会安全隐藏。")
+        say("已呼出 \(target.name)；再次按键会安全隐藏。")
     }
 
     private func reopenRunningApplication(
@@ -1175,7 +1261,7 @@ private final class ToggleEngine {
         let resolvedURL = workspace.urlForApplication(withBundleIdentifier: target.bundleIdentifier)
             ?? URL(fileURLWithPath: target.path)
         guard FileManager.default.fileExists(atPath: resolvedURL.path) else {
-            onStatus?("找不到目标应用，请重新选择。")
+            say("找不到目标应用，请重新选择。", .error)
             return
         }
         let configuration = NSWorkspace.OpenConfiguration()
@@ -1189,7 +1275,7 @@ private final class ToggleEngine {
                 let reopened = app ?? running
                 guard error == nil,
                       reopened.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
-                    self.onStatus?("无法重新打开目标应用窗口。")
+                    self.say("无法重新打开目标应用窗口。", .error)
                     return
                 }
                 self.session = ToggleSession(
@@ -1198,7 +1284,7 @@ private final class ToggleEngine {
                     state: .degraded,
                     createdAt: Date()
                 )
-                self.onStatus?("已重新打开并呼出 \(target.name)；再次按键将安全隐藏。")
+                self.say("已重新打开并呼出 \(target.name)；再次按键将安全隐藏。")
             }
         }
     }
@@ -1234,23 +1320,23 @@ private final class ToggleEngine {
         switch decision {
         case .hideTarget:
             guard current.hide() else {
-                onStatus?("系统暂时无法隐藏目标应用；没有关闭任何窗口。")
+                say("系统暂时无法隐藏目标应用；没有关闭任何窗口。", .error)
                 return decision
             }
             activatePrevious(session.previousProcessIdentifier)
-            onStatus?("已恢复按键前状态；没有关闭任何窗口。")
+            say("已恢复按键前状态；没有关闭任何窗口。")
         case .minimizeExactWindow:
             guard case .minimized(let window) = session.state,
                   Accessibility.isTrusted,
                   Accessibility.setMinimized(true, window: window) else {
-                onStatus?("窗口状态已变化，本次未自动最小化。")
+                say("窗口状态已变化，本次未自动最小化。", .warning)
                 return decision
             }
             activatePrevious(session.previousProcessIdentifier)
-            onStatus?("已只重新最小化本次恢复的窗口。")
+            say("已只重新最小化本次恢复的窗口。")
         case .activatePrevious:
             activatePrevious(session.previousProcessIdentifier)
-            onStatus?("目标窗口保持显示，已恢复之前的前台应用。")
+            say("目标窗口保持显示，已恢复之前的前台应用。")
         case .none:
             return .none
         }
@@ -1299,7 +1385,7 @@ private final class ToggleEngine {
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, self.isLaunching, self.launchGeneration == generation else { return }
             self.isLaunching = false
-            self.onStatus?("目标应用启动超时，可再试一次。")
+            self.say("目标应用启动超时，可再试一次。", .error)
         }
     }
 }
@@ -1313,6 +1399,9 @@ private final class QuickToggleModel {
     private(set) var isEnabled: Bool
     private(set) var settingsShortcut: Shortcut
     private(set) var statusMessage = "请添加应用并录制快捷键。"
+    private(set) var statusTone: StatusTone = .info
+    private var statusStickyUntil = Date.distantPast
+    private var hotKeyRecoveryFailed = false
 
     private let preferences: PreferenceStore?
     private var hotKeys: [UUID: HotKeyManager] = [:]
@@ -1345,17 +1434,19 @@ private final class QuickToggleModel {
         if isEnabled {
             let result = registerAll()
             if result.failed > 0 {
-                statusMessage = "已启用 \(result.active) 个快捷键；\(result.failed) 个发生冲突。"
+                applyStatus("已启用 \(result.active) 个快捷键；\(result.failed) 个发生冲突。", tone: .warning)
             } else if result.active > 0 {
-                statusMessage = "已启用 \(result.active) 个应用快捷键。"
+                applyStatus("已启用 \(result.active) 个应用快捷键。", tone: .info)
             }
         }
 
         if !diagnosticMode {
             switch settingsHotKey.replace(with: settingsShortcut) {
             case .success: break
-            case .failure(.occupied): statusMessage = "设置快捷键 \(settingsShortcut.displayName) 已被其他应用占用。"
-            case .failure(.failed): statusMessage = "系统无法注册设置快捷键 \(settingsShortcut.displayName)。"
+            case .failure(.occupied):
+                applyStatus("设置快捷键 \(settingsShortcut.displayName) 已被其他应用占用。", tone: .error)
+            case .failure(.failed):
+                applyStatus("系统无法注册设置快捷键 \(settingsShortcut.displayName)。", tone: .error)
             }
         }
     }
@@ -1369,18 +1460,15 @@ private final class QuickToggleModel {
 
     func addTarget(url: URL) -> Bool {
         guard let bundle = Bundle(url: url), let identifier = bundle.bundleIdentifier else {
-            statusMessage = "所选项目不是有效的 macOS 应用。"
-            onChange?()
+            reportStatus("所选项目不是有效的 macOS 应用。", tone: .error)
             return false
         }
         guard identifier != Bundle.main.bundleIdentifier else {
-            statusMessage = "不能把轻唤本身设为目标应用。"
-            onChange?()
+            reportStatus("不能把轻唤本身设为目标应用。", tone: .warning)
             return false
         }
         guard !bindings.contains(where: { $0.target.bundleIdentifier == identifier }) else {
-            statusMessage = "这个应用已经在列表里。"
-            onChange?()
+            reportStatus("这个应用已经在列表里。", tone: .warning)
             return false
         }
         let displayName = FileManager.default.displayName(atPath: url.path)
@@ -1396,21 +1484,18 @@ private final class QuickToggleModel {
             launchIfNeeded: true
         ))
         saveBindings()
-        statusMessage = "已添加 \(displayName)，请为它录制快捷键。"
-        onChange?()
+        reportStatus("已添加 \(displayName)，请为它录制快捷键。")
         return true
     }
 
     func applyShortcut(_ candidate: Shortcut, for bindingID: UUID) -> Bool {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return false }
         if let error = candidate.validationError {
-            statusMessage = error
-            onChange?()
+            reportStatus(error, tone: .error)
             return false
         }
         if shortcutIsUsed(candidate, in: bindings, excluding: bindingID) {
-            statusMessage = "该组合已用于其他应用，原快捷键仍然有效。"
-            onChange?()
+            reportStatus("该组合已用于其他应用，原快捷键仍然有效。", tone: .warning)
             return false
         }
 
@@ -1418,50 +1503,52 @@ private final class QuickToggleModel {
         let result = isEnabled ? manager.replace(with: candidate) : manager.probe(candidate)
         switch result {
         case .failure(.occupied):
-            statusMessage = "该组合已被其他应用或轻唤中的其他目标占用，原快捷键仍然有效。"
-            onChange?()
+            reportStatus("该组合已被其他应用或轻唤中的其他目标占用，原快捷键仍然有效。", tone: .warning)
             return false
         case .failure(.failed):
-            statusMessage = "系统无法注册该组合，原快捷键仍然有效。"
-            onChange?()
+            reportStatus("系统无法注册该组合，原快捷键仍然有效。", tone: .error)
             return false
         case .success:
             bindings[index].shortcut = candidate
             saveBindings()
-            statusMessage = candidate.riskWarning
-                ?? (isEnabled ? "\(bindings[index].target.name) 的快捷键已立即生效。" : "快捷键已保存，当前全部停用。")
-            onChange?()
+            if let warning = candidate.riskWarning {
+                reportStatus(warning, tone: .warning)
+            } else {
+                reportStatus(
+                    isEnabled
+                        ? "\(bindings[index].target.name) 的快捷键已立即生效。"
+                        : "快捷键已保存，当前全部停用。"
+                )
+            }
             return true
         }
     }
 
     func applySettingsShortcut(_ candidate: Shortcut) -> Bool {
         if let error = candidate.settingsValidationError {
-            statusMessage = error
-            onChange?()
+            reportStatus(error, tone: .error)
             return false
         }
         if bindings.contains(where: { $0.shortcut == candidate }) {
-            statusMessage = "该组合已用于应用快捷键，原设置快捷键仍然有效。"
-            onChange?()
+            reportStatus("该组合已用于应用快捷键，原设置快捷键仍然有效。", tone: .warning)
             return false
         }
 
         switch settingsHotKey.replace(with: candidate) {
         case .failure(.occupied):
-            statusMessage = "该组合已被其他应用占用，原设置快捷键仍然有效。"
-            onChange?()
+            reportStatus("该组合已被其他应用占用，原设置快捷键仍然有效。", tone: .warning)
             return false
         case .failure(.failed):
-            statusMessage = "系统无法注册该组合，原设置快捷键仍然有效。"
-            onChange?()
+            reportStatus("系统无法注册该组合，原设置快捷键仍然有效。", tone: .error)
             return false
         case .success:
             settingsShortcut = candidate
             preferences?.settingsShortcut = candidate
-            statusMessage = candidate.riskWarning
-                ?? "设置窗口快捷键已改为 \(candidate.displayName)，保存并立即生效。"
-            onChange?()
+            if let warning = candidate.riskWarning {
+                reportStatus(warning, tone: .warning)
+            } else {
+                reportStatus("设置窗口快捷键已改为 \(candidate.displayName)，保存并立即生效。")
+            }
             return true
         }
     }
@@ -1469,14 +1556,12 @@ private final class QuickToggleModel {
     func clearShortcut(for bindingID: UUID) -> Bool {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return false }
         if let manager = hotKeys[bindingID], manager.isActive, case .failure = manager.disable() {
-            statusMessage = "系统无法停用当前快捷键，原快捷键仍然有效。"
-            onChange?()
+            reportStatus("系统无法停用当前快捷键，原快捷键仍然有效。", tone: .error)
             return false
         }
         bindings[index].shortcut = nil
         saveBindings()
-        statusMessage = "已清除 \(bindings[index].target.name) 的快捷键。"
-        onChange?()
+        reportStatus("已清除 \(bindings[index].target.name) 的快捷键。")
         return true
     }
 
@@ -1484,10 +1569,11 @@ private final class QuickToggleModel {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return }
         bindings[index].launchIfNeeded.toggle()
         saveBindings()
-        statusMessage = bindings[index].launchIfNeeded
-            ? "\(bindings[index].target.name) 未运行时将自动打开。"
-            : "已关闭自动打开；\(bindings[index].target.name) 未运行时不会启动。"
-        onChange?()
+        reportStatus(
+            bindings[index].launchIfNeeded
+                ? "\(bindings[index].target.name) 未运行时将自动打开。"
+                : "已关闭自动打开；\(bindings[index].target.name) 未运行时不会启动。"
+        )
     }
 
     func removeBinding(_ bindingID: UUID) {
@@ -1497,8 +1583,7 @@ private final class QuickToggleModel {
         engines.removeValue(forKey: bindingID)?.cancelSession()
         bindings.remove(at: index)
         saveBindings()
-        statusMessage = "已移除 \(name)。"
-        onChange?()
+        reportStatus("已移除 \(name)。")
     }
 
     func toggleEnabled() {
@@ -1506,16 +1591,14 @@ private final class QuickToggleModel {
             for manager in hotKeys.values where manager.isActive {
                 guard case .success = manager.disable() else {
                     _ = registerAll()
-                    statusMessage = "系统无法完整停用快捷键，已恢复原状态。"
-                    onChange?()
+                    reportStatus("系统无法完整停用快捷键，已恢复原状态。", tone: .error)
                     return
                 }
             }
             isEnabled = false
             preferences?.enabled = false
             engines.values.forEach { $0.cancelSession() }
-            statusMessage = "所有应用快捷键已停用；\(settingsShortcut.displayName) 仍可显示或隐藏设置。"
-            onChange?()
+            reportStatus("所有应用快捷键已停用；\(settingsShortcut.displayName) 仍可显示或隐藏设置。")
             return
         }
 
@@ -1523,19 +1606,34 @@ private final class QuickToggleModel {
         preferences?.enabled = true
         let result = registerAll()
         if result.failed > 0 {
-            statusMessage = "已启用 \(result.active) 个快捷键；\(result.failed) 个冲突项保持停用。"
+            reportStatus("已启用 \(result.active) 个快捷键；\(result.failed) 个冲突项保持停用。", tone: .warning)
         } else if result.active > 0 {
-            statusMessage = "已启用 \(result.active) 个应用快捷键。"
+            reportStatus("已启用 \(result.active) 个应用快捷键。")
         } else {
-            statusMessage = "尚未录制应用快捷键。"
+            reportStatus("尚未录制应用快捷键。")
         }
-        onChange?()
     }
 
     func requestAccessibility() {
         Accessibility.request()
-        statusMessage = "已请求辅助功能权限；授权后返回轻唤即可刷新状态。"
-        onChange?()
+        reportStatus("已请求辅助功能权限；授权后返回轻唤即可刷新状态。")
+    }
+
+    var loginAtLaunchEnabled: Bool { LoginAtLaunch.status.isOn }
+
+    var loginAtLaunchHelp: String { LoginAtLaunch.status.helpText }
+
+    func setLoginAtLaunch(_ enabled: Bool) {
+        let (status, error) = LoginAtLaunch.setEnabled(enabled)
+        if let error {
+            reportStatus(error, tone: .warning)
+            return
+        }
+        reportStatus(
+            status.isOn
+                ? "已打开登录时启动；下次登录会自动运行轻唤。"
+                : "已关闭登录时启动。"
+        )
     }
 
     func close() {
@@ -1569,9 +1667,12 @@ private final class QuickToggleModel {
         preferences.importedVerifiedLaunchIDs = Array(imported).sorted()
         if added.isEmpty { return }
         if occupied.isEmpty {
-            statusMessage = "已加入 \(added.joined(separator: "、"))，可在本行直接修改快捷键。"
+            applyStatus("已加入 \(added.joined(separator: "、"))，可在本行直接修改快捷键。", tone: .info)
         } else {
-            statusMessage = "已加入 \(added.joined(separator: "、"))。\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。"
+            applyStatus(
+                "已加入 \(added.joined(separator: "、"))。\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。",
+                tone: .warning
+            )
         }
     }
 
@@ -1583,9 +1684,37 @@ private final class QuickToggleModel {
             failed += rebindAll().failed
         }
         if failed > 0 {
-            statusMessage = "快捷键注册已失效，已尝试恢复；仍有 \(failed) 个未成功。"
-            onChange?()
+            hotKeyRecoveryFailed = true
+            reportStatus("快捷键注册已失效，已尝试恢复；仍有 \(failed) 个未成功。", tone: .error)
+        } else if hotKeyRecoveryFailed {
+            hotKeyRecoveryFailed = false
+            reportStatus("快捷键已重新注册。")
         }
+    }
+
+    func reportStatus(_ message: String, tone: StatusTone = .info) {
+        applyStatus(message, tone: tone, preserveStickyFailure: false)
+        onChange?()
+    }
+
+    private func applyStatus(
+        _ message: String,
+        tone: StatusTone,
+        preserveStickyFailure: Bool = false
+    ) {
+        if preserveStickyFailure,
+           StatusPolicy.shouldKeepCurrent(
+            current: statusTone,
+            incoming: tone,
+            stickyUntil: statusStickyUntil
+           ) {
+            return
+        }
+        statusMessage = message
+        statusTone = tone
+        statusStickyUntil = tone == .info
+            ? .distantPast
+            : Date().addingTimeInterval(StatusPolicy.stickyDuration)
     }
 
     private func saveBindings() {
@@ -1603,8 +1732,8 @@ private final class QuickToggleModel {
     private func toggleEngine(for bindingID: UUID) -> ToggleEngine {
         if let engine = engines[bindingID] { return engine }
         let engine = ToggleEngine()
-        engine.onStatus = { [weak self] message in
-            self?.statusMessage = message
+        engine.onStatus = { [weak self] message, tone in
+            self?.applyStatus(message, tone: tone, preserveStickyFailure: tone == .info)
             self?.onChange?()
         }
         engines[bindingID] = engine
@@ -1838,6 +1967,7 @@ private final class SettingsController: NSObject {
     private let enableButton = NSButton()
     private let permissionButton = NSButton()
     private let permissionIcon = NSImageView()
+    private let loginButton = NSButton()
     private let settingsShortcutRecorder = ShortcutRecorderButton(frame: .zero)
     private let themeControl = NSSegmentedControl()
     private let guideButton = NSButton()
@@ -1848,11 +1978,10 @@ private final class SettingsController: NSObject {
     private let accentRail = AccentRailView(frame: .zero)
     private var guideAccentIcons: [NSImageView] = []
     private var lastRenderedBindings: [AppBinding]?
-    private var guideExpanded = false
-    private var appGuideExpanded = false
     private var colorTheme = ColorTheme.aurora
     private let helpPopover = NSPopover()
     private let addPopover = NSPopover()
+    private let referencePopover = NSPopover()
     private let pendingPicker = PendingApplicationPickerController()
 
     init(model: QuickToggleModel) {
@@ -1899,6 +2028,9 @@ private final class SettingsController: NSObject {
         countLabel.stringValue = "\(model.bindings.count) 个应用"
         permissionStatus.stringValue = model.accessibilityStatus
         generalStatus.stringValue = model.statusMessage
+        generalStatus.textColor = model.statusTone.color
+        loginButton.state = model.loginAtLaunchEnabled ? .on : .off
+        loginButton.toolTip = model.loginAtLaunchHelp
         settingsShortcutRecorder.shortcut = model.settingsShortcut
         enableButton.title = model.isEnabled ? "全部已启用" : "启用全部"
         enableButton.bezelColor = model.isEnabled ? colorTheme.primary : nil
@@ -1930,13 +2062,11 @@ private final class SettingsController: NSObject {
             self?.model.applySettingsShortcut(shortcut) == true
         }
         settingsShortcutRecorder.onClear = { [weak self] in
-            self?.generalStatus.stringValue = "设置窗口快捷键不能清除，请直接录制新组合。"
-            self?.generalStatus.textColor = .systemOrange
+            self?.model.reportStatus("设置窗口快捷键不能清除，请直接录制新组合。", tone: .warning)
             return false
         }
         settingsShortcutRecorder.onInvalid = { [weak self] message in
-            self?.generalStatus.stringValue = message
-            self?.generalStatus.textColor = .systemRed
+            self?.model.reportStatus(message, tone: .error)
         }
         settingsShortcutRecorder.widthAnchor.constraint(equalToConstant: 72).isActive = true
         settingsShortcutRecorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
@@ -2016,7 +2146,7 @@ private final class SettingsController: NSObject {
         listScroll.drawsBackground = false
         listScroll.setContentHuggingPriority(.init(1), for: .vertical)
         listScroll.setContentCompressionResistancePriority(.init(1), for: .vertical)
-        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 168).isActive = true
+        listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
 
         statusDot.widthAnchor.constraint(equalToConstant: 10).isActive = true
         statusDot.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -2065,6 +2195,18 @@ private final class SettingsController: NSObject {
         permissionRow.setAccessibilityLabel("辅助功能权限")
         permissionRow.setContentHuggingPriority(.required, for: .vertical)
 
+        loginButton.setButtonType(.switch)
+        loginButton.title = "登录时启动"
+        loginButton.target = self
+        loginButton.action = #selector(toggleLoginAtLaunch)
+        loginButton.font = .systemFont(ofSize: 12)
+        loginButton.controlSize = .small
+        loginButton.state = model.loginAtLaunchEnabled ? .on : .off
+        loginButton.toolTip = model.loginAtLaunchHelp
+        loginButton.setAccessibilityLabel("登录时启动轻唤")
+        loginButton.setAccessibilityHelp("默认关闭。打开后由 macOS 在登录时启动轻唤，不会新增后台进程。")
+        loginButton.setContentHuggingPriority(.required, for: .vertical)
+
         guideButton.title = "macOS 原生快捷键"
         guideButton.target = self
         guideButton.action = #selector(toggleGuide)
@@ -2108,7 +2250,7 @@ private final class SettingsController: NSObject {
         [shortcutGrid, nativeNote, customGuide].forEach {
             $0.widthAnchor.constraint(equalTo: guideContent.widthAnchor).isActive = true
         }
-        guideCard.heightAnchor.constraint(equalToConstant: 168).isActive = true
+        guideCard.frame = NSRect(x: 0, y: 0, width: 560, height: 168)
         guideCard.setAccessibilityLabel("macOS 原生快捷键指南")
         pin(guideContent, inside: guideCard, insets: NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18))
 
@@ -2156,9 +2298,7 @@ private final class SettingsController: NSObject {
         [applicationList, applicationNote].forEach {
             $0.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         }
-        appGuideCard.heightAnchor.constraint(equalToConstant: 148).isActive = true
-        appGuideCard.isHidden = true
-        guideCard.isHidden = true
+        appGuideCard.frame = NSRect(x: 0, y: 0, width: 560, height: 148)
         appGuideCard.setAccessibilityLabel("已安装应用的快捷键参考")
         pin(
             applicationGuideContent,
@@ -2177,16 +2317,18 @@ private final class SettingsController: NSObject {
         addPopover.contentViewController = pendingPicker
         addPopover.behavior = .transient
         helpPopover.behavior = .transient
+        referencePopover.behavior = .transient
         applyColorTheme(rebuildRows: false)
         applyAccessibilityChrome()
 
         let rootStack = verticalStack(
-            [header, applicationsCard, permissionRow, guideButton, guideCard, appGuideButton, appGuideCard],
+            [header, applicationsCard, permissionRow, loginButton, guideButton, appGuideButton],
             spacing: 10
         )
         rootStack.translatesAutoresizingMaskIntoConstraints = false
         material.addSubview(rootStack)
         header.setContentHuggingPriority(.required, for: .vertical)
+        loginButton.setContentHuggingPriority(.required, for: .vertical)
         guideButton.setContentHuggingPriority(.required, for: .vertical)
         appGuideButton.setContentHuggingPriority(.required, for: .vertical)
         NSLayoutConstraint.activate([
@@ -2197,10 +2339,9 @@ private final class SettingsController: NSObject {
             header.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             applicationsCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             permissionRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            loginButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             guideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            guideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            appGuideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
+            appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
         ])
         window.initialFirstResponder = addButton
     }
@@ -2208,6 +2349,7 @@ private final class SettingsController: NSObject {
     private func rebuildBindingRows() {
         helpPopover.performClose(nil)
         addPopover.performClose(nil)
+        referencePopover.performClose(nil)
         bindingsStack.arrangedSubviews.forEach {
             bindingsStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
@@ -2277,8 +2419,7 @@ private final class SettingsController: NSObject {
             self?.model.clearShortcut(for: binding.id) == true
         }
         recorder.onInvalid = { [weak self] message in
-            self?.generalStatus.stringValue = message
-            self?.generalStatus.textColor = .systemRed
+            self?.model.reportStatus(message, tone: .error)
         }
         recorder.controlSize = .small
         recorder.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
@@ -2487,6 +2628,11 @@ private final class SettingsController: NSObject {
 
     @objc private func toggleEnabled() { model.toggleEnabled() }
     @objc private func requestAccessibility() { model.requestAccessibility() }
+    @objc private func toggleLoginAtLaunch() {
+        model.setLoginAtLaunch(loginButton.state == .on)
+        loginButton.state = model.loginAtLaunchEnabled ? .on : .off
+        loginButton.toolTip = model.loginAtLaunchHelp
+    }
 
     @objc private func selectTheme() {
         colorTheme = themeControl.selectedSegment == 1 ? .ember : .aurora
@@ -2516,29 +2662,25 @@ private final class SettingsController: NSObject {
     }
 
     @objc private func toggleGuide() {
-        guideExpanded.toggle()
-        if guideExpanded { appGuideExpanded = false }
-        updateGuideVisibility()
+        showReferencePopover(guideCard, from: guideButton)
     }
 
     @objc private func toggleAppGuide() {
-        appGuideExpanded.toggle()
-        if appGuideExpanded { guideExpanded = false }
-        updateGuideVisibility()
+        showReferencePopover(appGuideCard, from: appGuideButton)
     }
 
-    private func updateGuideVisibility() {
-        guideCard.isHidden = !guideExpanded
-        appGuideCard.isHidden = !appGuideExpanded
-        guideButton.image = NSImage(
-            systemSymbolName: guideExpanded ? "chevron.down" : "chevron.right",
-            accessibilityDescription: nil
-        )
-        appGuideButton.image = NSImage(
-            systemSymbolName: appGuideExpanded ? "chevron.down" : "chevron.right",
-            accessibilityDescription: nil
-        )
-        window.recalculateKeyViewLoop()
+    private func showReferencePopover(_ card: NSView, from button: NSButton) {
+        if referencePopover.isShown,
+           referencePopover.contentViewController?.view === card {
+            referencePopover.performClose(nil)
+            return
+        }
+        card.removeFromSuperview()
+        let controller = NSViewController()
+        controller.view = card
+        referencePopover.contentViewController = controller
+        referencePopover.contentSize = card.frame.size
+        referencePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 }
 // MARK: - Menu bar application
@@ -2772,6 +2914,8 @@ private enum SelfTest {
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
         checkConfirmedShortcuts(&failures)
+        checkStatusPolicy(&failures)
+        checkLoginAtLaunch(&failures)
 
         if failures.isEmpty {
             print("QuickToggle self-test passed")
@@ -3122,6 +3266,47 @@ private enum SelfTest {
         store.saveBindings([migrated[0], second])
         if store.loadBindings().count != 2 {
             failures.append("multiple app bindings were not persisted")
+        }
+    }
+
+    private static func checkStatusPolicy(_ failures: inout [String]) {
+        let sticky = Date().addingTimeInterval(10)
+        if !StatusPolicy.shouldKeepCurrent(current: .error, incoming: .info, stickyUntil: sticky) {
+            failures.append("sticky failure was overwritten by runtime info")
+        }
+        if StatusPolicy.shouldKeepCurrent(current: .error, incoming: .error, stickyUntil: sticky) {
+            failures.append("new failure was blocked by an old failure")
+        }
+        if StatusPolicy.shouldKeepCurrent(current: .warning, incoming: .info, stickyUntil: sticky) == false {
+            failures.append("sticky warning was overwritten by runtime info")
+        }
+        if StatusPolicy.shouldKeepCurrent(current: .info, incoming: .info, stickyUntil: sticky) {
+            failures.append("info status was treated as sticky")
+        }
+        if StatusPolicy.shouldKeepCurrent(current: .error, incoming: .info, stickyUntil: .distantPast) {
+            failures.append("expired sticky failure still blocked info")
+        }
+    }
+
+    private static func checkLoginAtLaunch(_ failures: inout [String]) {
+        if LoginItemStatus.off.isOn {
+            failures.append("off login item was treated as enabled")
+        }
+        if !LoginItemStatus.on.isOn {
+            failures.append("enabled login item was treated as off")
+        }
+        if LoginItemStatus.needsApproval.isOn {
+            failures.append("needs-approval login item was treated as enabled")
+        }
+        if !LoginItemStatus.off.helpText.contains("默认关闭") {
+            failures.append("login item help lost the default-off copy")
+        }
+        if LoginAtLaunch.status == .on {
+            // User may already have enabled it; never register or unregister here.
+            return
+        }
+        if LoginAtLaunch.status != .off && LoginAtLaunch.status != .needsApproval && LoginAtLaunch.status != .unavailable {
+            failures.append("unexpected login item status \(String(describing: LoginAtLaunch.status))")
         }
     }
 }
