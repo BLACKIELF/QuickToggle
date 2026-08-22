@@ -3439,12 +3439,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshMenu()
     }
 
+    private static let displayVersion: String = {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(short) (build \(build))"
+    }()
+
     private func refreshMenu() {
         guard let statusItem else { return }
         let menu = NSMenu()
         let state = NSMenuItem(title: model.statusMessage, action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
+        let version = NSMenuItem(title: "轻唤 \(Self.displayVersion)", action: nil, keyEquivalent: "")
+        version.isEnabled = false
+        menu.addItem(version)
 
         for binding in model.bindings {
             let shortcut = binding.shortcut?.displayName ?? "未设置"

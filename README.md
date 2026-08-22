@@ -26,6 +26,8 @@ open "build/QuickToggle.app"
 - 支持多个应用，每个应用独立录制快捷键，推荐未占用的 `⌘0–9`，也可用 `⌘⌥K`、`⌘⇧K`、`⌃⇧K`、`⌘⌥←/→`、`⌃⇧F1–F12`。
 - 自动扫描已安装的可视应用，放入“待添加”选择器；不会把 Helper、后台组件写进主列表，也不会自动注册快捷键。
 - 本机已验证的应用快速启动（目前：微信 `⇧⌘W`）会加入列表。若该组合仍被原应用占用，在该行重新录制即可由轻唤接管，改完立即生效。轻唤不会去改应用自己的设置。
+- 「本机已占用」列表可编辑：设置 → 应用内快捷键区直接增删占用记录（名称 + 组合），录制自检会自动避开。
+- 配置导出/导入：菜单栏可把全部绑定、设置快捷键、启用状态和占用记录存成 JSON 备份，换机或重装后导入即可恢复；备份里本机未安装的应用会跳过并点名提示。
 - 每个应用旁有紧凑的 `?` 说明：当前轻唤热键、已确认的少量原生快捷键，以及如何自己查看。无法确认时不会编造。
 - 记住按键前的隐藏、最小化或显示状态，第二次按键尽量安全恢复。
 - 休眠、解锁或点开菜单栏后会自动重新注册快捷键；磁盘上的应用比正在运行的进程更新时会自动重启，不必再手动退出再进。
@@ -40,12 +42,12 @@ open "build/QuickToggle.app"
 首次启动会打开单页设置，之后默认按 `⌘3` 显示或隐藏：
 
 1. 点击“添加应用…”从已安装可视应用中选择，或改从磁盘挑选 `.app`；可重复添加多个应用。
-2. 在每个应用右侧分别录制快捷键。录制时会先确认应用还在，再探测该组合是否空闲（含本机已核实占用项）；占用则不改原键。
+2. 在每个应用右侧分别录制快捷键。录制时会先确认应用还在，再探测该组合是否空闲（含「本机已占用」列表，该列表可在设置中自行增删）；占用则不改原键。
 3. Esc 取消；Delete 或 Backspace 清除。
 4. 每个应用可独立设置“未运行时自动打开”，也可单独移除。
 5. 设置保存后立即生效，并通过 UserDefaults 保存在本机。
 
-菜单栏包含：显示设置、启用/停用全部快捷键、申请辅助功能权限、退出。设置页底部有默认关闭的“登录时启动”。macOS 原生快捷键和应用内快捷键默认收起，点开后在本页展开。
+菜单栏包含：显示设置、启用/停用全部快捷键、申请辅助功能权限、导出/导入配置、退出；顶部有一行只读的版本与构建号。设置页底部有默认关闭的“登录时启动”。macOS 原生快捷键和应用内快捷键默认收起，点开后在本页展开。
 
 ## 两次按键行为
 
@@ -81,8 +83,11 @@ bash selfcheck.sh
 ## 项目结构
 
 - `QuickToggle.swift`：全部应用逻辑与自检入口。
-- `build.sh`：无第三方依赖的 App Bundle 构建。
+- `VERSION`：版本号唯一来源，`build.sh` 构建时注入。
+- `build.sh`：无第三方依赖的 App Bundle 构建（默认 debug，`--release` 为优化构建）。
+- `package.sh`：release 构建 + 打出分发 zip。
 - `selfcheck.sh`：构建、自检、冒烟和资源测量。
+- `CHANGELOG.md`：版本更新日志。
 - `Assets/QuickToggleIcon-0817v2.icns`：应用图标。
 - `docs/使用说明.md`：中文详细说明。
 - `docs/screenshots/`：设置页示例图。
@@ -119,6 +124,8 @@ open "build/QuickToggle.app"
 
 - Multiple app bindings with one independently recorded shortcut per app. Unused `⌘0–9` combinations are recommended; `⌘⌥K`, `⌘⇧K`, `⌃⇧K`, `⌘⌥←/→`, and `⌃⇧F1–F12` are also allowed.
 - Scans installed visible apps into an “add app” picker. Helpers and background-only components stay out of the main list, and nothing is registered automatically.
+- The local occupied-hotkey list is user-editable in Settings; the recorder keeps avoiding whatever it contains.
+- Configuration export/import from the menu bar: a JSON backup carries every binding, the settings shortcut, the enabled state, and the occupied list. Import skips apps that are not installed and names them.
 - Each row has a compact `?` popover for the current QuickToggle hotkey, a few confirmed in-app shortcuts, and how to look them up. Unknown shortcuts are never invented.
 - Remembers whether the app was hidden, minimized, or visible and restores conservatively on the second press.
 - Optional “Open at Login”, off by default, using the system login item only.
