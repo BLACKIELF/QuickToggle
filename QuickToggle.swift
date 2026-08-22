@@ -1945,7 +1945,12 @@ private final class QuickToggleModel {
         ))
         saveBindings()
         if let suggested = nextFreeCommandDigit {
-            if applyShortcut(suggested, for: bindingID) { return true }
+            if applyShortcut(suggested, for: bindingID) {
+                reportStatus(
+                    "已为 \(displayName) 分配 \(suggested.displayName)：按一下呼出，再按一下藏回。点行内按钮可换键。"
+                )
+                return true
+            }
             return true
         }
         reportStatus("已添加 \(displayName)，请为它录制快捷键。")
@@ -3042,16 +3047,7 @@ private final class SettingsController: NSObject {
         }
 
         if model.bindings.isEmpty && model.occupiedHotKeys.isEmpty {
-            let message = model.nextFreeCommandDigit != nil
-                ? "还没有应用。点右上角「添加应用…」选一个，轻唤会自动分配下一个空闲的 ⌘ 数字，之后可随时在本行改。"
-                : "还没有应用。点击右上角“添加应用…”开始。"
-            let empty = NSTextField(wrappingLabelWithString: message)
-            empty.alignment = .center
-            empty.textColor = .secondaryLabelColor
-            empty.font = .systemFont(ofSize: 13, weight: .medium)
-            empty.heightAnchor.constraint(equalToConstant: 56).isActive = true
-            empty.setAccessibilityLabel("尚未添加应用")
-            bindingsStack.addArrangedSubview(empty)
+            bindingsStack.addArrangedSubview(makeWelcomeCard())
         } else {
             let rows = model.bindings.map(QuickToggleRow.binding)
                 + model.occupiedHotKeys.map(QuickToggleRow.occupied)
@@ -3072,6 +3068,39 @@ private final class SettingsController: NSObject {
         bindingsStack.arrangedSubviews.forEach {
             $0.widthAnchor.constraint(equalTo: bindingsStack.widthAnchor).isActive = true
         }
+    }
+
+    private func makeWelcomeCard() -> NSView {
+        let card = GlassCardView(frame: .zero)
+
+        let title = NSTextField(labelWithString: "欢迎使用轻唤")
+        title.font = .systemFont(ofSize: 17, weight: .bold)
+
+        let hasFreeDigit = model.nextFreeCommandDigit != nil
+        let steps = hasFreeDigit
+            ? "1. 点下方「添加第一个应用」，从已安装的应用里选\n2. 轻唤自动分配空闲的 ⌘ 数字（第一个是 ⌘1），立即生效\n3. 按一下呼出应用，再按一下藏回去；想换键就点行内按钮重录"
+            : "1. 点下方「添加第一个应用」，从已安装的应用里选\n2. 点行内按钮录制快捷键，推荐 ⌘ + 数字\n3. 按一下呼出应用，再按一下藏回去；想换键就点行内按钮重录"
+        let guide = NSTextField(wrappingLabelWithString: steps)
+        guide.font = .systemFont(ofSize: 12.5)
+        guide.textColor = .secondaryLabelColor
+        guide.alignment = .left
+
+        let start = NSButton(title: "添加第一个应用", target: self, action: #selector(chooseApplication))
+        start.bezelStyle = .rounded
+        start.controlSize = .large
+        start.bezelColor = colorTheme.primary
+        start.contentTintColor = .white
+        start.font = .systemFont(ofSize: 13.5, weight: .semibold)
+        start.setAccessibilityLabel("添加第一个应用")
+        start.setAccessibilityHelp("打开应用选择器，选中后轻唤会自动分配下一个空闲的 Command 数字键。")
+
+        let hint = NSTextField(labelWithString: "设置窗口本身的开关是 ⌘3，可随时在标题旁改。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+
+        let content = verticalStack([title, guide, start, hint], spacing: 10)
+        pin(content, inside: card, insets: NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20))
+        return card
     }
 
     private func makeOccupiedInlineRow(_ entry: OccupiedHotKeyEntry) -> NSView {
