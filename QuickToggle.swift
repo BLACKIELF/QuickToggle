@@ -2613,7 +2613,6 @@ private final class SettingsController: NSObject {
     private let helpPopover = NSPopover()
     private let addPopover = NSPopover()
     private let pendingPicker = PendingApplicationPickerController()
-    private let occupiedStack = FlippedStackView()
     private let occupiedNameField = NSTextField()
     private let occupiedRecorder = ShortcutRecorderButton(frame: .zero)
     private var lastRenderedOccupied: [OccupiedHotKeyEntry]?
@@ -2654,13 +2653,10 @@ private final class SettingsController: NSObject {
     }
 
     func refresh() {
-        if lastRenderedBindings != model.bindings {
+        if lastRenderedBindings != model.bindings || lastRenderedOccupied != model.occupiedHotKeys {
             lastRenderedBindings = model.bindings
-            rebuildBindingRows()
-        }
-        if lastRenderedOccupied != model.occupiedHotKeys {
             lastRenderedOccupied = model.occupiedHotKeys
-            rebuildOccupiedRows()
+            rebuildBindingRows()
         }
 
         countLabel.stringValue = "\(model.bindings.count) 个应用"
@@ -2921,13 +2917,9 @@ private final class SettingsController: NSObject {
             applicationList = verticalStack(applicationRows, spacing: 8)
         }
 
-        let occupiedTitle = NSTextField(labelWithString: "本机已占用（可编辑，录制时避开）")
+        let occupiedTitle = NSTextField(labelWithString: "添加本机占用记录（占用项按序显示在上方列表中）")
         occupiedTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
         occupiedTitle.textColor = .secondaryLabelColor
-
-        occupiedStack.orientation = .vertical
-        occupiedStack.alignment = .leading
-        occupiedStack.spacing = 6
 
         occupiedNameField.placeholderString = "占用方名称"
         occupiedNameField.font = .systemFont(ofSize: 12)
@@ -2971,13 +2963,12 @@ private final class SettingsController: NSObject {
         applicationNote.maximumNumberOfLines = 2
 
         let applicationGuideContent = verticalStack(
-            [occupiedTitle, occupiedStack, occupiedAddRow, applicationList, applicationNote],
+            [occupiedTitle, occupiedAddRow, applicationList, applicationNote],
             spacing: 10
         )
         [occupiedTitle, occupiedAddRow, applicationList, applicationNote].forEach {
             $0.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         }
-        occupiedStack.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         appGuideCard.heightAnchor.constraint(equalToConstant: 220).isActive = true
         appGuideCard.isHidden = true
         guideCard.isHidden = true
@@ -3081,63 +3072,6 @@ private final class SettingsController: NSObject {
         bindingsStack.arrangedSubviews.forEach {
             $0.widthAnchor.constraint(equalTo: bindingsStack.widthAnchor).isActive = true
         }
-    }
-
-    private func rebuildOccupiedRows() {
-        occupiedStack.arrangedSubviews.forEach {
-            occupiedStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        let entries = model.occupiedHotKeys
-        if entries.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "暂无占用记录。")
-            empty.alignment = .center
-            empty.textColor = .secondaryLabelColor
-            empty.font = .systemFont(ofSize: 11.5)
-            empty.heightAnchor.constraint(equalToConstant: 24).isActive = true
-            empty.setAccessibilityLabel("暂无本机占用记录")
-            occupiedStack.addArrangedSubview(empty)
-        } else {
-            entries.enumerated().forEach { index, entry in
-                occupiedStack.addArrangedSubview(makeOccupiedRow(entry, at: index))
-            }
-        }
-        occupiedStack.arrangedSubviews.forEach {
-            $0.widthAnchor.constraint(equalTo: occupiedStack.widthAnchor).isActive = true
-        }
-    }
-
-    private func makeOccupiedRow(_ entry: OccupiedHotKeyEntry, at index: Int) -> NSView {
-        let row = NSBox()
-        row.boxType = .custom
-        row.cornerRadius = 8
-        row.borderWidth = 1
-        row.borderColor = .separatorColor.withAlphaComponent(0.45)
-        row.fillColor = .controlBackgroundColor.withAlphaComponent(0.34)
-        row.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        row.setAccessibilityLabel("占用记录 \(entry.name)")
-
-        let name = NSTextField(labelWithString: entry.name)
-        name.font = .systemFont(ofSize: 12, weight: .semibold)
-        name.lineBreakMode = .byTruncatingTail
-        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let keys = NSTextField(labelWithString: entry.shortcut.displayName)
-        keys.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
-        keys.textColor = .secondaryLabelColor
-
-        let remove = NSButton(title: "移除", target: self, action: #selector(removeOccupiedAction(_:)))
-        remove.bezelStyle = .rounded
-        remove.controlSize = .small
-        remove.tag = index
-        remove.setAccessibilityLabel("移除占用记录 \(entry.name)")
-
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        let content = horizontalStack([name, keys, spacer, remove], spacing: 8)
-        pin(content, inside: row, insets: NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10))
-        return row
     }
 
     private func makeOccupiedInlineRow(_ entry: OccupiedHotKeyEntry) -> NSView {
@@ -3606,9 +3540,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         version.isEnabled = false
         menu.addItem(version)
 
-        for binding in BindingOrder.sorted(model.bindings) {
-            let shortcut = binding.shortcut?.displayName ?? "未设置"
-            let item = NSMenuItem(title: "\(binding.target.name)：\(shortcut)", action: nil, keyEquivalent: "")
+        let rows = model.bindings.map(QuickToggleRow.binding)
+            + model.occupiedHotKeys.map(QuickToggleRow.occupied)
+        for row in BindingOrder.sorted(rows) {
+            let title: String
+            switch row {
+            case .binding(let binding):
+                let shortcut = binding.shortcut?.displayName ?? "未设置"
+                title = "\(binding.target.name)：\(shortcut)"
+            case .occupied(let entry):
+                title = "\(entry.name)：\(entry.shortcut.displayName)（本机占用）"
+            }
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         }
