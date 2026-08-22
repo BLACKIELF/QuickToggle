@@ -156,6 +156,7 @@ private final class PreferenceStore {
         static let launchIfNeeded = "quickToggle.launchIfNeeded"
         static let importedVerifiedLaunchIDs = "quickToggle.importedVerifiedLaunchIDs"
         static let importedSuggestedAppIDs = "quickToggle.importedSuggestedAppIDs"
+        static let occupiedHotKeys = "quickToggle.occupiedHotKeys"
     }
 
     private let defaults: UserDefaults
@@ -213,6 +214,16 @@ private final class PreferenceStore {
     var importedSuggestedAppIDs: [String] {
         get { defaults.stringArray(forKey: Key.importedSuggestedAppIDs) ?? [] }
         set { defaults.set(newValue, forKey: Key.importedSuggestedAppIDs) }
+    }
+
+    func loadOccupiedHotKeys() -> [OccupiedHotKeyEntry] {
+        if let saved = decode([OccupiedHotKeyEntry].self, forKey: Key.occupiedHotKeys) { return saved }
+        encode(OccupiedHotKeys.seed, forKey: Key.occupiedHotKeys)
+        return OccupiedHotKeys.seed
+    }
+
+    func saveOccupiedHotKeys(_ entries: [OccupiedHotKeyEntry]) {
+        encode(entries, forKey: Key.occupiedHotKeys)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
@@ -429,28 +440,36 @@ private enum ApplicationScanner {
     }
 }
 
+private struct OccupiedHotKeyEntry: Codable, Equatable {
+    let name: String
+    let shortcut: Shortcut
+}
+
 private enum OccupiedHotKeys {
-    static let entries: [(name: String, shortcut: Shortcut)] = [
-        (
-            "Aident",
-            Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey), label: "1")
+    static let seed: [OccupiedHotKeyEntry] = [
+        OccupiedHotKeyEntry(
+            name: "Aident",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey), label: "1")
         ),
-        (
-            "Wi‑Fi 菜单",
-            Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey), label: "2")
+        OccupiedHotKeyEntry(
+            name: "Wi‑Fi 菜单",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey), label: "2")
         ),
-        (
-            "微信",
-            Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
+        OccupiedHotKeyEntry(
+            name: "微信",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
         )
     ]
 
-    static var summary: String {
+    static func summary(of entries: [OccupiedHotKeyEntry]) -> String {
+        guard !entries.isEmpty else {
+            return "本机已占用：暂无记录。把其他软件占用的组合加进来，轻唤录制时会自动避开。"
+        }
         let body = entries.map { "\($0.name) \($0.shortcut.displayName)" }.joined(separator: "，")
         return "本机已占用：\(body)。不要再录进轻唤。"
     }
 
-    static func owner(of shortcut: Shortcut) -> String? {
+    static func owner(of shortcut: Shortcut, in entries: [OccupiedHotKeyEntry]) -> String? {
         entries.first { $0.shortcut == shortcut }?.name
     }
 }
@@ -479,7 +498,8 @@ private enum ShortcutProbe {
         path: String? = nil,
         bindings: [AppBinding],
         excluding: UUID,
-        asSettings: Bool
+        asSettings: Bool,
+        occupied: [OccupiedHotKeyEntry]
     ) -> Verdict {
         if !asSettings, let bundleIdentifier, let path,
            !appIsPresent(bundleIdentifier: bundleIdentifier, path: path) {
@@ -493,7 +513,7 @@ private enum ShortcutProbe {
         if shortcutIsUsed(shortcut, in: bindings, excluding: excluding) {
             return .usedByQuickToggle
         }
-        if let owner = OccupiedHotKeys.owner(of: shortcut) {
+        if let owner = OccupiedHotKeys.owner(of: shortcut, in: occupied) {
             return .occupiedLocally(owner)
         }
         return .ready
@@ -1675,6 +1695,7 @@ private final class QuickToggleModel {
     var onChange: (() -> Void)?
     var onSettingsHotKey: (() -> Void)?
     private(set) var bindings: [AppBinding]
+    private(set) var occupiedHotKeys: [OccupiedHotKeyEntry] = []
     private(set) var isEnabled: Bool
     private(set) var settingsShortcut: Shortcut
     private(set) var statusMessage = "请添加应用并录制快捷键。"
@@ -1703,6 +1724,7 @@ private final class QuickToggleModel {
             let store = PreferenceStore()
             preferences = store
             bindings = store.loadBindings()
+            occupiedHotKeys = store.loadOccupiedHotKeys()
             isEnabled = store.enabled
             settingsShortcut = store.settingsShortcut ?? Self.defaultSettingsShortcut
             importVerifiedLaunchApps()
@@ -1778,7 +1800,8 @@ private final class QuickToggleModel {
             path: binding.target.path,
             bindings: bindings,
             excluding: bindingID,
-            asSettings: false
+            asSettings: false,
+            occupied: occupiedHotKeys
         ) {
         case .invalid(let error):
             reportStatus(error, tone: .error)
@@ -1826,7 +1849,8 @@ private final class QuickToggleModel {
             candidate,
             bindings: bindings,
             excluding: UUID(),
-            asSettings: true
+            asSettings: true,
+            occupied: occupiedHotKeys
         ) {
         case .invalid(let error):
             reportStatus(error, tone: .error)
@@ -2019,6 +2043,34 @@ private final class QuickToggleModel {
                 tone: .warning
             )
         }
+    }
+
+    func addOccupiedHotKey(name: String, shortcut: Shortcut) -> Bool {
+        guard let preferences else { return false }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            reportStatus("请先填写占用方名称。", tone: .error)
+            return false
+        }
+        if OccupiedHotKeys.owner(of: shortcut, in: occupiedHotKeys) != nil {
+            reportStatus("该组合已在占用列表中。", tone: .warning)
+            return false
+        }
+        if bindings.contains(where: { $0.shortcut == shortcut }) {
+            reportStatus("该组合已是轻唤的热键，无需再标记占用。", tone: .warning)
+            return false
+        }
+        occupiedHotKeys.append(OccupiedHotKeyEntry(name: trimmed, shortcut: shortcut))
+        preferences.saveOccupiedHotKeys(occupiedHotKeys)
+        reportStatus("已记录本机占用：\(trimmed) \(shortcut.displayName)。录制时会避开它。")
+        return true
+    }
+
+    func removeOccupiedHotKey(_ entry: OccupiedHotKeyEntry) {
+        guard let preferences else { return }
+        occupiedHotKeys.removeAll { $0 == entry }
+        preferences.saveOccupiedHotKeys(occupiedHotKeys)
+        reportStatus("已移除占用记录：\(entry.name) \(entry.shortcut.displayName)。")
     }
 
     func recoverHotKeys() {
@@ -2329,6 +2381,10 @@ private final class SettingsController: NSObject {
     private let helpPopover = NSPopover()
     private let addPopover = NSPopover()
     private let pendingPicker = PendingApplicationPickerController()
+    private let occupiedStack = FlippedStackView()
+    private let occupiedNameField = NSTextField()
+    private let occupiedRecorder = ShortcutRecorderButton(frame: .zero)
+    private var lastRenderedOccupied: [OccupiedHotKeyEntry]?
 
     init(model: QuickToggleModel) {
         self.model = model
@@ -2369,6 +2425,10 @@ private final class SettingsController: NSObject {
         if lastRenderedBindings != model.bindings {
             lastRenderedBindings = model.bindings
             rebuildBindingRows()
+        }
+        if lastRenderedOccupied != model.occupiedHotKeys {
+            lastRenderedOccupied = model.occupiedHotKeys
+            rebuildOccupiedRows()
         }
 
         countLabel.stringValue = "\(model.bindings.count) 个应用"
@@ -2629,10 +2689,47 @@ private final class SettingsController: NSObject {
             applicationList = verticalStack(applicationRows, spacing: 8)
         }
 
-        let occupiedNote = NSTextField(wrappingLabelWithString: OccupiedHotKeys.summary)
-        occupiedNote.font = .systemFont(ofSize: 11.5, weight: .medium)
-        occupiedNote.textColor = .secondaryLabelColor
-        occupiedNote.maximumNumberOfLines = 2
+        let occupiedTitle = NSTextField(labelWithString: "本机已占用（可编辑，录制时避开）")
+        occupiedTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        occupiedTitle.textColor = .secondaryLabelColor
+
+        occupiedStack.orientation = .vertical
+        occupiedStack.alignment = .leading
+        occupiedStack.spacing = 6
+
+        occupiedNameField.placeholderString = "占用方名称"
+        occupiedNameField.font = .systemFont(ofSize: 12)
+        occupiedNameField.bezelStyle = .roundedBezel
+        occupiedNameField.controlSize = .small
+        occupiedNameField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        occupiedNameField.setAccessibilityLabel("占用方名称")
+
+        occupiedRecorder.controlSize = .small
+        occupiedRecorder.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+        occupiedRecorder.bezelColor = colorTheme.recorder
+        occupiedRecorder.onRecord = { _ in true }
+        occupiedRecorder.onClear = { true }
+        occupiedRecorder.onInvalid = { [weak self] message in
+            self?.model.reportStatus(message, tone: .error)
+        }
+        occupiedRecorder.widthAnchor.constraint(equalToConstant: 108).isActive = true
+        occupiedRecorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        occupiedRecorder.setAccessibilityLabel("占用组合录制")
+        occupiedRecorder.toolTip = "录制其他软件已占用的组合，再点“添加”"
+
+        let occupiedAddButton = NSButton(
+            title: "添加",
+            target: self,
+            action: #selector(addOccupiedAction)
+        )
+        occupiedAddButton.bezelStyle = .rounded
+        occupiedAddButton.controlSize = .small
+        occupiedAddButton.setAccessibilityLabel("添加本机占用记录")
+
+        let occupiedAddRow = horizontalStack(
+            [occupiedNameField, occupiedRecorder, occupiedAddButton],
+            spacing: 8
+        )
 
         let applicationNote = NSTextField(wrappingLabelWithString:
             "只收录本机核实过的项，避免和轻唤热键撞车。未列出的请看应用菜单，不要猜测。"
@@ -2642,12 +2739,13 @@ private final class SettingsController: NSObject {
         applicationNote.maximumNumberOfLines = 2
 
         let applicationGuideContent = verticalStack(
-            [occupiedNote, applicationList, applicationNote],
+            [occupiedTitle, occupiedStack, occupiedAddRow, applicationList, applicationNote],
             spacing: 10
         )
-        [occupiedNote, applicationList, applicationNote].forEach {
+        [occupiedTitle, occupiedAddRow, applicationList, applicationNote].forEach {
             $0.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         }
+        occupiedStack.widthAnchor.constraint(equalTo: applicationGuideContent.widthAnchor).isActive = true
         appGuideCard.heightAnchor.constraint(equalToConstant: 220).isActive = true
         appGuideCard.isHidden = true
         guideCard.isHidden = true
@@ -2739,6 +2837,79 @@ private final class SettingsController: NSObject {
         bindingsStack.arrangedSubviews.forEach {
             $0.widthAnchor.constraint(equalTo: bindingsStack.widthAnchor).isActive = true
         }
+    }
+
+    private func rebuildOccupiedRows() {
+        occupiedStack.arrangedSubviews.forEach {
+            occupiedStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        let entries = model.occupiedHotKeys
+        if entries.isEmpty {
+            let empty = NSTextField(wrappingLabelWithString: "暂无占用记录。")
+            empty.alignment = .center
+            empty.textColor = .secondaryLabelColor
+            empty.font = .systemFont(ofSize: 11.5)
+            empty.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            empty.setAccessibilityLabel("暂无本机占用记录")
+            occupiedStack.addArrangedSubview(empty)
+        } else {
+            entries.enumerated().forEach { index, entry in
+                occupiedStack.addArrangedSubview(makeOccupiedRow(entry, at: index))
+            }
+        }
+        occupiedStack.arrangedSubviews.forEach {
+            $0.widthAnchor.constraint(equalTo: occupiedStack.widthAnchor).isActive = true
+        }
+    }
+
+    private func makeOccupiedRow(_ entry: OccupiedHotKeyEntry, at index: Int) -> NSView {
+        let row = NSBox()
+        row.boxType = .custom
+        row.cornerRadius = 8
+        row.borderWidth = 1
+        row.borderColor = .separatorColor.withAlphaComponent(0.45)
+        row.fillColor = .controlBackgroundColor.withAlphaComponent(0.34)
+        row.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        row.setAccessibilityLabel("占用记录 \(entry.name)")
+
+        let name = NSTextField(labelWithString: entry.name)
+        name.font = .systemFont(ofSize: 12, weight: .semibold)
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let keys = NSTextField(labelWithString: entry.shortcut.displayName)
+        keys.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
+        keys.textColor = .secondaryLabelColor
+
+        let remove = NSButton(title: "移除", target: self, action: #selector(removeOccupiedAction(_:)))
+        remove.bezelStyle = .rounded
+        remove.controlSize = .small
+        remove.tag = index
+        remove.setAccessibilityLabel("移除占用记录 \(entry.name)")
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let content = horizontalStack([name, keys, spacer, remove], spacing: 8)
+        pin(content, inside: row, insets: NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10))
+        return row
+    }
+
+    @objc private func addOccupiedAction() {
+        guard let shortcut = occupiedRecorder.shortcut else {
+            model.reportStatus("请先录制要标记为占用的组合。", tone: .error)
+            return
+        }
+        guard model.addOccupiedHotKey(name: occupiedNameField.stringValue, shortcut: shortcut) else { return }
+        occupiedNameField.stringValue = ""
+        occupiedRecorder.shortcut = nil
+    }
+
+    @objc private func removeOccupiedAction(_ sender: NSButton) {
+        let entries = model.occupiedHotKeys
+        guard entries.indices.contains(sender.tag) else { return }
+        model.removeOccupiedHotKey(entries[sender.tag])
     }
 
     private func makeBindingRow(_ binding: AppBinding) -> NSView {
@@ -3286,6 +3457,7 @@ private enum SelfTest {
         checkHotKeyRouting(&failures)
         checkHotKeyRebind(&failures)
         checkMultiBindingPreferences(&failures)
+        checkOccupiedHotKeys(&failures)
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
         checkConfirmedShortcuts(&failures)
@@ -3527,7 +3699,8 @@ private enum SelfTest {
         if !ConfirmedAppShortcuts.entries(for: "com.apple.ActivityMonitor").isEmpty {
             failures.append("Activity Monitor in-app shortcuts were invented")
         }
-        if !OccupiedHotKeys.summary.contains("Aident ⌘1") || !OccupiedHotKeys.summary.contains("Wi‑Fi") {
+        let occupiedSummary = OccupiedHotKeys.summary(of: OccupiedHotKeys.seed)
+        if !occupiedSummary.contains("Aident ⌘1") || !occupiedSummary.contains("Wi‑Fi") {
             failures.append("occupied hotkey summary lost verified local conflicts")
         }
         checkShortcutProbe(&failures)
@@ -3538,16 +3711,16 @@ private enum SelfTest {
         let commandTwo = Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: UInt32(cmdKey), label: "2")
         let wechat = Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
         let feishu = Shortcut(keyCode: UInt32(kVK_ANSI_F), modifiers: UInt32(cmdKey | shiftKey), label: "F")
-        if OccupiedHotKeys.owner(of: commandOne) != "Aident" {
+        if OccupiedHotKeys.owner(of: commandOne, in: OccupiedHotKeys.seed) != "Aident" {
             failures.append("⌘1 was not flagged as Aident")
         }
-        if OccupiedHotKeys.owner(of: commandTwo) != "Wi‑Fi 菜单" {
+        if OccupiedHotKeys.owner(of: commandTwo, in: OccupiedHotKeys.seed) != "Wi‑Fi 菜单" {
             failures.append("⌘2 was not flagged as Wi-Fi menu")
         }
-        if OccupiedHotKeys.owner(of: wechat) != "微信" {
+        if OccupiedHotKeys.owner(of: wechat, in: OccupiedHotKeys.seed) != "微信" {
             failures.append("⇧⌘W was not flagged as WeChat")
         }
-        if OccupiedHotKeys.owner(of: feishu) != nil {
+        if OccupiedHotKeys.owner(of: feishu, in: OccupiedHotKeys.seed) != nil {
             failures.append("⇧⌘F was treated as locally occupied")
         }
 
@@ -3565,7 +3738,8 @@ private enum SelfTest {
             path: "/Applications/Safari.app",
             bindings: [bound],
             excluding: UUID(),
-            asSettings: false
+            asSettings: false,
+            occupied: OccupiedHotKeys.seed
         )
         if aident != .occupiedLocally("Aident") {
             failures.append("shortcut probe missed Aident occupancy")
@@ -3577,7 +3751,8 @@ private enum SelfTest {
             path: "/Applications/Safari.app",
             bindings: [bound],
             excluding: UUID(),
-            asSettings: false
+            asSettings: false,
+            occupied: []
         )
         if duplicate != .usedByQuickToggle {
             failures.append("shortcut probe missed an in-app duplicate")
@@ -3589,7 +3764,8 @@ private enum SelfTest {
             path: "/Applications/DoesNotExist.app",
             bindings: [],
             excluding: UUID(),
-            asSettings: false
+            asSettings: false,
+            occupied: []
         )
         if case .missingApp = missing {
         } else {
@@ -3602,7 +3778,8 @@ private enum SelfTest {
             path: "/Applications/Safari.app",
             bindings: [bound],
             excluding: boundID,
-            asSettings: false
+            asSettings: false,
+            occupied: []
         )
         if ready != .ready {
             failures.append("free shortcut was not ready after local probe")
@@ -3757,6 +3934,50 @@ private enum SelfTest {
         store.saveBindings([migrated[0], second])
         if store.loadBindings().count != 2 {
             failures.append("multiple app bindings were not persisted")
+        }
+    }
+
+    private static func checkOccupiedHotKeys(_ failures: inout [String]) {
+        let suiteName = "com.quicktoggle.selftest.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            failures.append("could not create isolated defaults")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = PreferenceStore(defaults: defaults)
+
+        if store.loadOccupiedHotKeys() != OccupiedHotKeys.seed {
+            failures.append("occupied hot key list was not seeded on first read")
+        }
+        if store.loadOccupiedHotKeys() != OccupiedHotKeys.seed {
+            failures.append("occupied hot key seeding was not idempotent")
+        }
+
+        let custom = [OccupiedHotKeyEntry(
+            name: "测试工具",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_9), modifiers: UInt32(cmdKey), label: "9")
+        )]
+        store.saveOccupiedHotKeys(custom)
+        if store.loadOccupiedHotKeys() != custom {
+            failures.append("custom occupied hot key list was not persisted")
+        }
+
+        if !OccupiedHotKeys.summary(of: []).contains("暂无") {
+            failures.append("empty occupied summary lost its guidance")
+        }
+        if OccupiedHotKeys.owner(of: custom[0].shortcut, in: custom) != "测试工具" {
+            failures.append("custom occupied entry did not resolve its owner")
+        }
+
+        let inspected = ShortcutProbe.inspect(
+            custom[0].shortcut,
+            bindings: [],
+            excluding: UUID(),
+            asSettings: true,
+            occupied: custom
+        )
+        if inspected != .occupiedLocally("测试工具") {
+            failures.append("shortcut probe missed a custom occupied entry")
         }
     }
 
