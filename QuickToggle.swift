@@ -520,6 +520,76 @@ private enum ShortcutProbe {
     }
 }
 
+private enum ConfigurationExchange {
+    static let formatVersion = 1
+
+    struct Payload: Codable, Equatable {
+        var formatVersion: Int
+        var appVersion: String
+        var exportedAt: Date
+        var bindings: [AppBinding]
+        var settingsShortcut: Shortcut?
+        var enabled: Bool
+        var launchIfNeeded: Bool
+        var importedVerifiedLaunchIDs: [String]
+        var importedSuggestedAppIDs: [String]
+        var occupiedHotKeys: [OccupiedHotKeyEntry]
+    }
+
+    static func makePayload(
+        bindings: [AppBinding],
+        settingsShortcut: Shortcut?,
+        enabled: Bool,
+        launchIfNeeded: Bool,
+        importedVerifiedLaunchIDs: [String],
+        importedSuggestedAppIDs: [String],
+        occupiedHotKeys: [OccupiedHotKeyEntry],
+        appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+        now: Date = Date()
+    ) -> Payload {
+        Payload(
+            formatVersion: formatVersion,
+            appVersion: appVersion,
+            exportedAt: now,
+            bindings: bindings,
+            settingsShortcut: settingsShortcut,
+            enabled: enabled,
+            launchIfNeeded: launchIfNeeded,
+            importedVerifiedLaunchIDs: importedVerifiedLaunchIDs,
+            importedSuggestedAppIDs: importedSuggestedAppIDs,
+            occupiedHotKeys: occupiedHotKeys
+        )
+    }
+
+    static func encode(_ payload: Payload) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? encoder.encode(payload)
+    }
+
+    static func decode(_ data: Data) -> Payload? {
+        guard let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.formatVersion == formatVersion else { return nil }
+        return payload
+    }
+
+    static func partitionImportable(_ bindings: [AppBinding]) -> (importable: [AppBinding], missing: [String]) {
+        var importable: [AppBinding] = []
+        var missing: [String] = []
+        for binding in bindings {
+            if ShortcutProbe.appIsPresent(
+                bundleIdentifier: binding.target.bundleIdentifier,
+                path: binding.target.path
+            ) {
+                importable.append(binding)
+            } else {
+                missing.append(binding.target.name)
+            }
+        }
+        return (importable, missing)
+    }
+}
+
 private enum ConfirmedAppShortcuts {
     static let catalog: [(bundleIdentifier: String, name: String)] = [
         ("com.tencent.xinWeChat", "微信"),
@@ -2073,6 +2143,68 @@ private final class QuickToggleModel {
         reportStatus("已移除占用记录：\(entry.name) \(entry.shortcut.displayName)。")
     }
 
+    func exportConfiguration() -> ConfigurationExchange.Payload {
+        ConfigurationExchange.makePayload(
+            bindings: bindings,
+            settingsShortcut: settingsShortcut,
+            enabled: isEnabled,
+            launchIfNeeded: preferences?.launchIfNeeded ?? true,
+            importedVerifiedLaunchIDs: preferences?.importedVerifiedLaunchIDs ?? [],
+            importedSuggestedAppIDs: preferences?.importedSuggestedAppIDs ?? [],
+            occupiedHotKeys: occupiedHotKeys
+        )
+    }
+
+    func importableBindings(in payload: ConfigurationExchange.Payload) -> (importable: [AppBinding], missing: [String]) {
+        ConfigurationExchange.partitionImportable(payload.bindings)
+    }
+
+    func applyImportedConfiguration(_ payload: ConfigurationExchange.Payload) -> Bool {
+        guard let preferences else { return false }
+        let (importable, missing) = ConfigurationExchange.partitionImportable(payload.bindings)
+        guard !importable.isEmpty else { return false }
+
+        hotKeys.values.forEach { $0.close() }
+        hotKeys.removeAll()
+        engines.values.forEach { $0.cancelSession() }
+        engines.removeAll()
+
+        bindings = importable
+        occupiedHotKeys = payload.occupiedHotKeys
+        preferences.saveBindings(bindings)
+        preferences.saveOccupiedHotKeys(occupiedHotKeys)
+        preferences.launchIfNeeded = payload.launchIfNeeded
+        preferences.importedVerifiedLaunchIDs = payload.importedVerifiedLaunchIDs
+        preferences.importedSuggestedAppIDs = payload.importedSuggestedAppIDs
+
+        if payload.enabled != isEnabled {
+            preferences.enabled = payload.enabled
+            isEnabled = payload.enabled
+        }
+
+        if let shortcut = payload.settingsShortcut,
+           case .success = settingsHotKey.replace(with: shortcut) {
+            settingsShortcut = shortcut
+            preferences.settingsShortcut = shortcut
+        }
+
+        var message = "已导入 \(importable.count) 条绑定"
+        if !missing.isEmpty {
+            message += "；跳过缺失应用：\(missing.joined(separator: "、"))"
+        }
+        if isEnabled {
+            let result = registerAll()
+            if result.failed > 0 {
+                reportStatus(message + "；\(result.failed) 个快捷键冲突未注册。", tone: .warning)
+            } else {
+                reportStatus(message + "，\(result.active) 个快捷键已生效。")
+            }
+        } else {
+            reportStatus(message + "；快捷键当前全部停用，可在菜单栏或设置中启用。")
+        }
+        return true
+    }
+
     func recoverHotKeys() {
         guard preferences != nil else { return }
         var failed = 0
@@ -3332,6 +3464,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         addMenuItem("显示设置", action: #selector(showSettingsAction), key: ",", to: menu)
         addMenuItem(model.isEnabled ? "停用全部快捷键" : "启用全部快捷键", action: #selector(toggleEnabledAction), to: menu)
         addMenuItem("申请辅助功能权限", action: #selector(requestAccessibilityAction), to: menu)
+        addMenuItem("导出配置…", action: #selector(exportConfigurationAction), to: menu)
+        addMenuItem("导入配置…", action: #selector(importConfigurationAction), to: menu)
         menu.addItem(.separator())
         addMenuItem("退出", action: #selector(quitAction), key: "q", to: menu)
         menu.delegate = self
@@ -3381,6 +3515,71 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
     @objc private func toggleEnabledAction() { model.toggleEnabled() }
     @objc private func requestAccessibilityAction() { model.requestAccessibility() }
+
+    @objc private func exportConfigurationAction() {
+        let payload = model.exportConfiguration()
+        guard let data = ConfigurationExchange.encode(payload) else {
+            model.reportStatus("导出失败：无法生成配置文件。", tone: .error)
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.title = "导出轻唤配置"
+        panel.message = "备份当前全部应用绑定、设置快捷键与本机占用记录。"
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd"
+        panel.nameFieldStringValue = "quicktoggle-backup-\(formatter.string(from: Date())).json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try data.write(to: url, options: .atomic)
+            model.reportStatus("配置已导出：\(url.lastPathComponent)。")
+        } catch {
+            model.reportStatus("导出失败：无法写入所选位置。", tone: .error)
+        }
+    }
+
+    @objc private func importConfigurationAction() {
+        recoverHotKeysIfNeeded()
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.title = "导入轻唤配置"
+        panel.message = "选择此前导出的 JSON 备份；导入会替换当前绑定。"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = try? Data(contentsOf: url) else {
+            model.reportStatus("导入失败：无法读取所选文件。", tone: .error)
+            return
+        }
+        guard let payload = ConfigurationExchange.decode(data) else {
+            model.reportStatus("导入失败：这不是有效的轻唤配置备份。", tone: .error)
+            return
+        }
+        let (importable, missing) = model.importableBindings(in: payload)
+        if importable.isEmpty {
+            model.reportStatus(
+                missing.isEmpty
+                    ? "备份里没有应用绑定，无需导入。"
+                    : "备份里的应用（\(missing.joined(separator: "、"))）都不在本机，未导入。",
+                tone: .warning
+            )
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "导入配置并替换当前设置？"
+        var detail = "将用备份中的 \(importable.count) 条绑定替换当前 \(model.bindings.count) 条；设置快捷键、启用状态和本机占用记录一并替换。"
+        if !missing.isEmpty {
+            detail += "缺失应用将跳过：\(missing.joined(separator: "、"))。"
+        }
+        alert.informativeText = detail
+        alert.addButton(withTitle: "导入")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = model.applyImportedConfiguration(payload)
+    }
+
     @objc private func quitAction() { NSApp.terminate(nil) }
 
     private func observeWorkspaceRecovery() {
@@ -3458,6 +3657,7 @@ private enum SelfTest {
         checkHotKeyRebind(&failures)
         checkMultiBindingPreferences(&failures)
         checkOccupiedHotKeys(&failures)
+        checkConfigurationExchange(&failures)
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
         checkConfirmedShortcuts(&failures)
@@ -3978,6 +4178,70 @@ private enum SelfTest {
         )
         if inspected != .occupiedLocally("测试工具") {
             failures.append("shortcut probe missed a custom occupied entry")
+        }
+    }
+
+    private static func checkConfigurationExchange(_ failures: inout [String]) {
+        let safari = AppBinding(
+            id: UUID(),
+            target: TargetApplication(
+                bundleIdentifier: "com.apple.Safari",
+                name: "Safari",
+                path: "/Applications/Safari.app"
+            ),
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | shiftKey), label: "S"),
+            launchIfNeeded: true
+        )
+        let ghost = AppBinding(
+            id: UUID(),
+            target: TargetApplication(
+                bundleIdentifier: "com.quicktoggle.missing.app",
+                name: "Ghost",
+                path: "/Applications/Ghost.app"
+            ),
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_G), modifiers: UInt32(cmdKey | shiftKey), label: "G"),
+            launchIfNeeded: false
+        )
+        let payload = ConfigurationExchange.makePayload(
+            bindings: [safari, ghost],
+            settingsShortcut: Shortcut(keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(cmdKey), label: "3"),
+            enabled: true,
+            launchIfNeeded: false,
+            importedVerifiedLaunchIDs: ["com.tencent.xinWeChat"],
+            importedSuggestedAppIDs: ["com.apple.Terminal"],
+            occupiedHotKeys: OccupiedHotKeys.seed,
+            appVersion: "test",
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        if payload.formatVersion != ConfigurationExchange.formatVersion {
+            failures.append("backup payload carried the wrong format version")
+        }
+        guard let data = ConfigurationExchange.encode(payload),
+              let decoded = ConfigurationExchange.decode(data) else {
+            failures.append("backup payload did not round-trip")
+            return
+        }
+        if decoded != payload {
+            failures.append("backup payload changed across a round-trip")
+        }
+        if ConfigurationExchange.decode(Data("[not json".utf8)) != nil {
+            failures.append("corrupt backup data was accepted")
+        }
+        var foreign = payload
+        foreign.formatVersion = ConfigurationExchange.formatVersion + 99
+        if let foreignData = ConfigurationExchange.encode(foreign),
+           ConfigurationExchange.decode(foreignData) != nil {
+            failures.append("backup with a foreign format version was accepted")
+        }
+
+        let (importable, missing) = ConfigurationExchange.partitionImportable([safari, ghost])
+        if importable.map(\.id) != [safari.id] || missing != ["Ghost"] {
+            failures.append("import filter did not drop missing apps")
+        }
+
+        let diagnostic = QuickToggleModel(diagnosticMode: true)
+        if diagnostic.applyImportedConfiguration(payload) {
+            failures.append("diagnostic mode applied an imported configuration")
         }
     }
 
