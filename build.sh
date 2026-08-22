@@ -8,14 +8,31 @@ APP="$BUILD_DIR/$APP_NAME.app"
 BIN="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
 
+VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION")"
+BUILD_NUMBER="$(git -C "$SCRIPT_DIR" rev-list --count HEAD 2>/dev/null || echo 0)"
+
+CONFIG="debug"
+case "${1:-}" in
+  --release) CONFIG="release" ;;
+  "") ;;
+  *) echo "用法: build.sh [--release]" >&2; exit 2 ;;
+esac
+
 rm -rf "$APP"
 mkdir -p "$BIN" "$RES"
 
-echo "→ Debug 编译中..."
-/usr/bin/swiftc "$SCRIPT_DIR/QuickToggle.swift" \
-  -Onone -g -warnings-as-errors \
-  -framework AppKit -framework Carbon -framework ApplicationServices -framework ServiceManagement \
-  -target "arm64-apple-macosx13.0" \
+SWIFT_FLAGS=(
+  -warnings-as-errors
+  -framework AppKit -framework Carbon -framework ApplicationServices -framework ServiceManagement
+  -target "arm64-apple-macosx13.0"
+)
+case "$CONFIG" in
+  debug)   SWIFT_FLAGS+=(-Onone -g) ;;
+  release) SWIFT_FLAGS+=(-O -whole-module-optimization) ;;
+esac
+
+echo "→ 编译中（$CONFIG，版本 $VERSION build $BUILD_NUMBER）..."
+/usr/bin/swiftc "$SCRIPT_DIR/QuickToggle.swift" "${SWIFT_FLAGS[@]}" \
   -o "$BIN/$APP_NAME"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -26,9 +43,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>QuickToggle</string>
   <key>CFBundleDisplayName</key><string>轻唤</string>
   <key>CFBundleIdentifier</key><string>com.quicktoggle.app</string>
-  <key>CFBundleVersion</key><string>5</string>
-  <key>CFBundleShortVersionString</key><string>0.0.5</string>
-  <key>CFBundleGetInfoString</key><string>QuickToggle（轻唤）0.0.5</string>
+  <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleGetInfoString</key><string>QuickToggle（轻唤）${VERSION}</string>
   <key>CFBundleExecutable</key><string>QuickToggle</string>
   <key>CFBundleIconFile</key><string>QuickToggleIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

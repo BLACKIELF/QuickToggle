@@ -8,9 +8,18 @@ TMP="$(mktemp -d)"
 PID=""
 trap 'if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 
-echo "=== QuickToggle（轻唤）0.0.5 自检 ==="
+VERSION="$(tr -d '[:space:]' < "$DIR/VERSION")"
+
+echo "=== QuickToggle（轻唤）$VERSION 自检 ==="
 bash "$DIR/build.sh"
 /usr/bin/codesign --verify --deep --strict "$APP"
+
+PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null)"
+if [ "$PLIST_VERSION" != "$VERSION" ]; then
+  echo "版本不一致：VERSION=$VERSION，Info.plist=$PLIST_VERSION" >&2
+  exit 1
+fi
+echo "版本一致性: $VERSION ✓"
 "$BIN" --self-test
 "$BIN" --smoke-test
 
