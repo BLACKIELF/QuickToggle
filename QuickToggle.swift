@@ -218,8 +218,11 @@ private final class PreferenceStore {
 
     func loadOccupiedHotKeys() -> [OccupiedHotKeyEntry] {
         if let saved = decode([OccupiedHotKeyEntry].self, forKey: Key.occupiedHotKeys) { return saved }
-        encode(OccupiedHotKeys.seed, forKey: Key.occupiedHotKeys)
-        return OccupiedHotKeys.seed
+        let legacyInstall = defaults.object(forKey: Key.bindings) != nil
+            || defaults.object(forKey: Key.target) != nil
+        let initial: [OccupiedHotKeyEntry] = legacyInstall ? OccupiedHotKeys.seed : []
+        encode(initial, forKey: Key.occupiedHotKeys)
+        return initial
     }
 
     func saveOccupiedHotKeys(_ entries: [OccupiedHotKeyEntry]) {
@@ -471,6 +474,29 @@ private enum OccupiedHotKeys {
 
     static func owner(of shortcut: Shortcut, in entries: [OccupiedHotKeyEntry]) -> String? {
         entries.first { $0.shortcut == shortcut }?.name
+    }
+}
+
+private enum ShortcutSuggester {
+    static let commandDigits: [(keyCode: UInt32, label: String)] = [
+        (UInt32(kVK_ANSI_1), "1"), (UInt32(kVK_ANSI_2), "2"), (UInt32(kVK_ANSI_3), "3"),
+        (UInt32(kVK_ANSI_4), "4"), (UInt32(kVK_ANSI_5), "5"), (UInt32(kVK_ANSI_6), "6"),
+        (UInt32(kVK_ANSI_7), "7"), (UInt32(kVK_ANSI_8), "8"), (UInt32(kVK_ANSI_9), "9")
+    ]
+
+    static func nextFreeCommandDigit(
+        bindings: [AppBinding],
+        occupied: [OccupiedHotKeyEntry],
+        settingsShortcut: Shortcut?
+    ) -> Shortcut? {
+        for (keyCode, label) in commandDigits {
+            let candidate = Shortcut(keyCode: keyCode, modifiers: UInt32(cmdKey), label: label)
+            if OccupiedHotKeys.owner(of: candidate, in: occupied) != nil { continue }
+            if bindings.contains(where: { $0.shortcut == candidate }) { continue }
+            if settingsShortcut == candidate { continue }
+            return candidate
+        }
+        return nil
     }
 }
 
@@ -1845,8 +1871,9 @@ private final class QuickToggleModel {
         }
         let displayName = FileManager.default.displayName(atPath: url.path)
             .replacingOccurrences(of: ".app", with: "")
+        let bindingID = UUID()
         bindings.append(AppBinding(
-            id: UUID(),
+            id: bindingID,
             target: TargetApplication(
                 bundleIdentifier: identifier,
                 name: displayName,
@@ -1856,8 +1883,20 @@ private final class QuickToggleModel {
             launchIfNeeded: true
         ))
         saveBindings()
+        if let suggested = nextFreeCommandDigit {
+            if applyShortcut(suggested, for: bindingID) { return true }
+            return true
+        }
         reportStatus("已添加 \(displayName)，请为它录制快捷键。")
         return true
+    }
+
+    var nextFreeCommandDigit: Shortcut? {
+        ShortcutSuggester.nextFreeCommandDigit(
+            bindings: bindings,
+            occupied: occupiedHotKeys,
+            settingsShortcut: settingsShortcut
+        )
     }
 
     func applyShortcut(_ candidate: Shortcut, for bindingID: UUID) -> Bool {
@@ -2951,7 +2990,10 @@ private final class SettingsController: NSObject {
         }
 
         if model.bindings.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "还没有应用。点击右上角“添加应用…”开始。")
+            let message = model.nextFreeCommandDigit != nil
+                ? "还没有应用。点右上角「添加应用…」选一个，轻唤会自动分配下一个空闲的 ⌘ 数字，之后可随时在本行改。"
+                : "还没有应用。点击右上角“添加应用…”开始。"
+            let empty = NSTextField(wrappingLabelWithString: message)
             empty.alignment = .center
             empty.textColor = .secondaryLabelColor
             empty.font = .systemFont(ofSize: 13, weight: .medium)
@@ -3666,6 +3708,7 @@ private enum SelfTest {
         checkHotKeyRebind(&failures)
         checkMultiBindingPreferences(&failures)
         checkOccupiedHotKeys(&failures)
+        checkShortcutSuggester(&failures)
         checkConfigurationExchange(&failures)
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
@@ -4155,11 +4198,28 @@ private enum SelfTest {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = PreferenceStore(defaults: defaults)
 
-        if store.loadOccupiedHotKeys() != OccupiedHotKeys.seed {
-            failures.append("occupied hot key list was not seeded on first read")
+        if !store.loadOccupiedHotKeys().isEmpty {
+            failures.append("fresh install was seeded with another machine's occupied hot keys")
         }
-        if store.loadOccupiedHotKeys() != OccupiedHotKeys.seed {
-            failures.append("occupied hot key seeding was not idempotent")
+        if !store.loadOccupiedHotKeys().isEmpty {
+            failures.append("fresh occupied hot key state was not persisted")
+        }
+
+        let legacySuite = "com.quicktoggle.selftest.\(UUID().uuidString)"
+        guard let legacyDefaults = UserDefaults(suiteName: legacySuite) else {
+            failures.append("could not create isolated legacy defaults")
+            return
+        }
+        defer { legacyDefaults.removePersistentDomain(forName: legacySuite) }
+        let legacyStore = PreferenceStore(defaults: legacyDefaults)
+        legacyStore.saveBindings([AppBinding(
+            id: UUID(),
+            target: TargetApplication(bundleIdentifier: "test.one", name: "One", path: "/One.app"),
+            shortcut: nil,
+            launchIfNeeded: true
+        )])
+        if legacyStore.loadOccupiedHotKeys() != OccupiedHotKeys.seed {
+            failures.append("legacy install was not migrated to the seeded occupied list")
         }
 
         let custom = [OccupiedHotKeyEntry(
@@ -4187,6 +4247,56 @@ private enum SelfTest {
         )
         if inspected != .occupiedLocally("测试工具") {
             failures.append("shortcut probe missed a custom occupied entry")
+        }
+    }
+
+    private static func checkShortcutSuggester(_ failures: inout [String]) {
+        let settings = Shortcut(keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(cmdKey), label: "3")
+
+        let fresh = ShortcutSuggester.nextFreeCommandDigit(
+            bindings: [], occupied: [], settingsShortcut: settings
+        )
+        if fresh?.keyCode != UInt32(kVK_ANSI_1) || fresh?.label != "1" {
+            failures.append("fresh install did not start with Cmd+1")
+        }
+
+        let withSeed = ShortcutSuggester.nextFreeCommandDigit(
+            bindings: [], occupied: OccupiedHotKeys.seed, settingsShortcut: settings
+        )
+        if withSeed?.keyCode != UInt32(kVK_ANSI_4) || withSeed?.label != "4" {
+            failures.append("occupied seed and settings shortcut did not push the suggestion to Cmd+4")
+        }
+
+        let shiftedOne = Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey | shiftKey), label: "1")
+        let binding = AppBinding(
+            id: UUID(),
+            target: TargetApplication(bundleIdentifier: "test.one", name: "One", path: "/One.app"),
+            shortcut: shiftedOne,
+            launchIfNeeded: true
+        )
+        let notBlocked = ShortcutSuggester.nextFreeCommandDigit(
+            bindings: [binding], occupied: [], settingsShortcut: settings
+        )
+        if notBlocked?.keyCode != UInt32(kVK_ANSI_1) {
+            failures.append("a Shift+Cmd+1 binding wrongly blocked the Cmd+1 suggestion")
+        }
+
+        var all: [AppBinding] = []
+        for (index, digit) in ShortcutSuggester.commandDigits.enumerated()
+        where digit.keyCode != UInt32(kVK_ANSI_3) {
+            all.append(AppBinding(
+                id: UUID(),
+                target: TargetApplication(
+                    bundleIdentifier: "test.\(index)",
+                    name: "App\(index)",
+                    path: "/App\(index).app"
+                ),
+                shortcut: Shortcut(keyCode: digit.keyCode, modifiers: UInt32(cmdKey), label: digit.label),
+                launchIfNeeded: true
+            ))
+        }
+        if ShortcutSuggester.nextFreeCommandDigit(bindings: all, occupied: [], settingsShortcut: settings) != nil {
+            failures.append("a fully allocated keyboard still suggested a command digit")
         }
     }
 

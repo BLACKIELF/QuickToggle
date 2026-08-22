@@ -23,7 +23,7 @@ open "build/QuickToggle.app"
 
 ## 特性
 
-- 支持多个应用，每个应用独立录制快捷键，推荐未占用的 `⌘0–9`，也可用 `⌘⌥K`、`⌘⇧K`、`⌃⇧K`、`⌘⌥←/→`、`⌃⇧F1–F12`。
+- 支持多个应用，每个应用独立录制快捷键，推荐未占用的 `⌘0–9`，也可用 `⌘⌥K`、`⌘⇧K`、`⌃⇧K`、`⌘⌥←/→`、`⌃⇧F1–F12`。添加应用时若 `⌘1–9` 有空闲组合会自动分配下一个（跳过已占用项），首次使用从 `⌘1` 依次排起；不满意可当场在本行改。
 - 自动扫描已安装的可视应用，放入“待添加”选择器；不会把 Helper、后台组件写进主列表，也不会自动注册快捷键。
 - 本机已验证的应用快速启动（目前：微信 `⇧⌘W`）会加入列表。若该组合仍被原应用占用，在该行重新录制即可由轻唤接管，改完立即生效。轻唤不会去改应用自己的设置。
 - 「本机已占用」列表可编辑：设置 → 应用内快捷键区直接增删占用记录（名称 + 组合），录制自检会自动避开。
@@ -122,7 +122,7 @@ open "build/QuickToggle.app"
 
 ### Features
 
-- Multiple app bindings with one independently recorded shortcut per app. Unused `⌘0–9` combinations are recommended; `⌘⌥K`, `⌘⇧K`, `⌃⇧K`, `⌘⌥←/→`, and `⌃⇧F1–F12` are also allowed.
+- Multiple app bindings with one independently recorded shortcut per app. Unused `⌘0–9` combinations are recommended; `⌘⌥K`, `⌘⇧K`, `⌃⇧K`, `⌘⌥←/→`, and `⌃⇧F1–F12` are also allowed. When a free `⌘1–9` exists, adding an app auto-assigns the next one (skipping occupied entries), so a fresh install fills sequentially from `⌘1`.
 - Scans installed visible apps into an “add app” picker. Helpers and background-only components stay out of the main list, and nothing is registered automatically.
 - The local occupied-hotkey list is user-editable in Settings; the recorder keeps avoiding whatever it contains.
 - Configuration export/import from the menu bar: a JSON backup carries every binding, the settings shortcut, the enabled state, and the occupied list. Import skips apps that are not installed and names them.
