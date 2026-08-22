@@ -477,6 +477,11 @@ private enum OccupiedHotKeys {
     }
 }
 
+private enum QuickToggleRow {
+    case binding(AppBinding)
+    case occupied(OccupiedHotKeyEntry)
+}
+
 private enum BindingOrder {
     static let digitKeyCodes: [UInt32] = [
         UInt32(kVK_ANSI_0), UInt32(kVK_ANSI_1), UInt32(kVK_ANSI_2), UInt32(kVK_ANSI_3),
@@ -484,7 +489,7 @@ private enum BindingOrder {
         UInt32(kVK_ANSI_7), UInt32(kVK_ANSI_8), UInt32(kVK_ANSI_9)
     ]
 
-    private struct SortKey: Comparable {
+    struct SortKey: Comparable {
         let rank: Int
         let number: Int
         let label: String
@@ -498,19 +503,38 @@ private enum BindingOrder {
         }
     }
 
-    private static func sortKey(_ binding: AppBinding) -> SortKey {
-        guard let shortcut = binding.shortcut else {
-            return SortKey(rank: 2, number: Int.max, label: "", name: binding.target.name)
+    static func sortKey(_ binding: AppBinding) -> SortKey {
+        sortKey(shortcut: binding.shortcut, name: binding.target.name)
+    }
+
+    static func sortKey(_ entry: OccupiedHotKeyEntry) -> SortKey {
+        sortKey(shortcut: entry.shortcut, name: entry.name)
+    }
+
+    static func sortKey(_ row: QuickToggleRow) -> SortKey {
+        switch row {
+        case .binding(let binding): return sortKey(binding)
+        case .occupied(let entry): return sortKey(entry)
+        }
+    }
+
+    private static func sortKey(shortcut: Shortcut?, name: String) -> SortKey {
+        guard let shortcut else {
+            return SortKey(rank: 2, number: Int.max, label: "", name: name)
         }
         if shortcut.modifiers == UInt32(cmdKey),
            let digit = digitKeyCodes.firstIndex(of: shortcut.keyCode) {
-            return SortKey(rank: 0, number: digit, label: "", name: binding.target.name)
+            return SortKey(rank: 0, number: digit, label: "", name: name)
         }
-        return SortKey(rank: 1, number: Int.max, label: shortcut.label, name: binding.target.name)
+        return SortKey(rank: 1, number: Int.max, label: shortcut.label, name: name)
     }
 
     static func sorted(_ bindings: [AppBinding]) -> [AppBinding] {
         bindings.sorted { sortKey($0) < sortKey($1) }
+    }
+
+    static func sorted(_ rows: [QuickToggleRow]) -> [QuickToggleRow] {
+        rows.sorted { sortKey($0) < sortKey($1) }
     }
 }
 
@@ -3026,7 +3050,7 @@ private final class SettingsController: NSObject {
             $0.removeFromSuperview()
         }
 
-        if model.bindings.isEmpty {
+        if model.bindings.isEmpty && model.occupiedHotKeys.isEmpty {
             let message = model.nextFreeCommandDigit != nil
                 ? "还没有应用。点右上角「添加应用…」选一个，轻唤会自动分配下一个空闲的 ⌘ 数字，之后可随时在本行改。"
                 : "还没有应用。点击右上角“添加应用…”开始。"
@@ -3038,8 +3062,15 @@ private final class SettingsController: NSObject {
             empty.setAccessibilityLabel("尚未添加应用")
             bindingsStack.addArrangedSubview(empty)
         } else {
-            BindingOrder.sorted(model.bindings).forEach {
-                bindingsStack.addArrangedSubview(makeBindingRow($0))
+            let rows = model.bindings.map(QuickToggleRow.binding)
+                + model.occupiedHotKeys.map(QuickToggleRow.occupied)
+            BindingOrder.sorted(rows).forEach { row in
+                switch row {
+                case .binding(let binding):
+                    bindingsStack.addArrangedSubview(makeBindingRow(binding))
+                case .occupied(let entry):
+                    bindingsStack.addArrangedSubview(makeOccupiedInlineRow(entry))
+                }
             }
         }
 
@@ -3106,6 +3137,45 @@ private final class SettingsController: NSObject {
 
         let content = horizontalStack([name, keys, spacer, remove], spacing: 8)
         pin(content, inside: row, insets: NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10))
+        return row
+    }
+
+    private func makeOccupiedInlineRow(_ entry: OccupiedHotKeyEntry) -> NSView {
+        let row = NSBox()
+        row.boxType = .custom
+        row.cornerRadius = 8
+        row.borderWidth = 1
+        row.borderColor = .separatorColor.withAlphaComponent(0.45)
+        row.fillColor = .controlBackgroundColor.withAlphaComponent(0.18)
+        row.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        row.setAccessibilityLabel("本机占用 \(entry.name) \(entry.shortcut.displayName)")
+
+        let badge = NSTextField(labelWithString: "本机占用")
+        badge.font = .systemFont(ofSize: 10, weight: .semibold)
+        badge.textColor = .systemOrange
+
+        let name = NSTextField(labelWithString: entry.name)
+        name.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        name.textColor = .secondaryLabelColor
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let keys = NSTextField(labelWithString: entry.shortcut.displayName)
+        keys.font = .monospacedSystemFont(ofSize: 12.5, weight: .semibold)
+        keys.textColor = .secondaryLabelColor
+
+        let remove = NSButton(title: "移除", target: self, action: #selector(removeOccupiedAction(_:)))
+        remove.bezelStyle = .rounded
+        remove.controlSize = .small
+        remove.tag = model.occupiedHotKeys.firstIndex(of: entry) ?? -1
+        remove.isEnabled = remove.tag >= 0
+        remove.setAccessibilityLabel("移除占用记录 \(entry.name)")
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let content = horizontalStack([badge, name, keys, spacer, remove], spacing: 8)
+        pin(content, inside: row, insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10))
         return row
     }
 
@@ -4382,6 +4452,30 @@ private enum SelfTest {
         ]).map(\.target.name)
         if letters != ["Shift4", "Zed"] {
             failures.append("shifted digits did not sort with letter shortcuts by label: \(letters)")
+        }
+
+        let occupiedOne = OccupiedHotKeyEntry(
+            name: "Aident",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: UInt32(cmdKey), label: "1")
+        )
+        let occupiedWeChat = OccupiedHotKeyEntry(
+            name: "微信",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey | shiftKey), label: "W")
+        )
+        let mixedRows = BindingOrder.sorted([
+            .occupied(occupiedWeChat),
+            .binding(binding("Four", keyCode: UInt32(kVK_ANSI_4), label: "4")),
+            .occupied(occupiedOne),
+            .binding(binding("Zed", keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey | shiftKey), label: "Z"))
+        ])
+        let rowNames = mixedRows.map { row -> String in
+            switch row {
+            case .binding(let b): return b.target.name
+            case .occupied(let e): return e.name
+            }
+        }
+        if rowNames != ["Aident", "Four", "微信", "Zed"] {
+            failures.append("occupied entries did not interleave by shortcut order: \(rowNames)")
         }
     }
 
