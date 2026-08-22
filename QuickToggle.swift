@@ -477,6 +477,43 @@ private enum OccupiedHotKeys {
     }
 }
 
+private enum BindingOrder {
+    static let digitKeyCodes: [UInt32] = [
+        UInt32(kVK_ANSI_0), UInt32(kVK_ANSI_1), UInt32(kVK_ANSI_2), UInt32(kVK_ANSI_3),
+        UInt32(kVK_ANSI_4), UInt32(kVK_ANSI_5), UInt32(kVK_ANSI_6),
+        UInt32(kVK_ANSI_7), UInt32(kVK_ANSI_8), UInt32(kVK_ANSI_9)
+    ]
+
+    private struct SortKey: Comparable {
+        let rank: Int
+        let number: Int
+        let label: String
+        let name: String
+
+        static func < (lhs: SortKey, rhs: SortKey) -> Bool {
+            if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+            if lhs.number != rhs.number { return lhs.number < rhs.number }
+            if lhs.label != rhs.label { return lhs.label < rhs.label }
+            return lhs.name < rhs.name
+        }
+    }
+
+    private static func sortKey(_ binding: AppBinding) -> SortKey {
+        guard let shortcut = binding.shortcut else {
+            return SortKey(rank: 2, number: Int.max, label: "", name: binding.target.name)
+        }
+        if shortcut.modifiers == UInt32(cmdKey),
+           let digit = digitKeyCodes.firstIndex(of: shortcut.keyCode) {
+            return SortKey(rank: 0, number: digit, label: "", name: binding.target.name)
+        }
+        return SortKey(rank: 1, number: Int.max, label: shortcut.label, name: binding.target.name)
+    }
+
+    static func sorted(_ bindings: [AppBinding]) -> [AppBinding] {
+        bindings.sorted { sortKey($0) < sortKey($1) }
+    }
+}
+
 private enum ShortcutSuggester {
     static let commandDigits: [(keyCode: UInt32, label: String)] = [
         (UInt32(kVK_ANSI_1), "1"), (UInt32(kVK_ANSI_2), "2"), (UInt32(kVK_ANSI_3), "3"),
@@ -3001,7 +3038,9 @@ private final class SettingsController: NSObject {
             empty.setAccessibilityLabel("尚未添加应用")
             bindingsStack.addArrangedSubview(empty)
         } else {
-            model.bindings.forEach { bindingsStack.addArrangedSubview(makeBindingRow($0)) }
+            BindingOrder.sorted(model.bindings).forEach {
+                bindingsStack.addArrangedSubview(makeBindingRow($0))
+            }
         }
 
         let width = max(listScroll.contentSize.width, 560)
@@ -3497,7 +3536,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         version.isEnabled = false
         menu.addItem(version)
 
-        for binding in model.bindings {
+        for binding in BindingOrder.sorted(model.bindings) {
             let shortcut = binding.shortcut?.displayName ?? "未设置"
             let item = NSMenuItem(title: "\(binding.target.name)：\(shortcut)", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -3709,6 +3748,7 @@ private enum SelfTest {
         checkMultiBindingPreferences(&failures)
         checkOccupiedHotKeys(&failures)
         checkShortcutSuggester(&failures)
+        checkBindingOrder(&failures)
         checkConfigurationExchange(&failures)
         checkRecorderGate(&failures)
         checkApplicationScanner(&failures)
@@ -4297,6 +4337,51 @@ private enum SelfTest {
         }
         if ShortcutSuggester.nextFreeCommandDigit(bindings: all, occupied: [], settingsShortcut: settings) != nil {
             failures.append("a fully allocated keyboard still suggested a command digit")
+        }
+    }
+
+    private static func checkBindingOrder(_ failures: inout [String]) {
+        func binding(
+            _ name: String,
+            keyCode: UInt32? = nil,
+            modifiers: UInt32 = UInt32(cmdKey),
+            label: String = ""
+        ) -> AppBinding {
+            AppBinding(
+                id: UUID(),
+                target: TargetApplication(bundleIdentifier: "test.\(name)", name: name, path: "/\(name).app"),
+                shortcut: keyCode.map { Shortcut(keyCode: $0, modifiers: modifiers, label: label) },
+                launchIfNeeded: true
+            )
+        }
+        let mixed: [AppBinding] = [
+            binding("Safari", keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey | shiftKey), label: "S"),
+            binding("Nine", keyCode: UInt32(kVK_ANSI_9), label: "9"),
+            binding("None"),
+            binding("Four", keyCode: UInt32(kVK_ANSI_4), label: "4"),
+            binding("Apple", keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | shiftKey), label: "A"),
+            binding("Zero", keyCode: UInt32(kVK_ANSI_0), label: "0")
+        ]
+        let ordered = BindingOrder.sorted(mixed).map(\.target.name)
+        if ordered != ["Zero", "Four", "Nine", "Apple", "Safari", "None"] {
+            failures.append("bindings were not sorted command-digits first: \(ordered)")
+        }
+
+        let tie = BindingOrder.sorted([
+            binding("B9", keyCode: UInt32(kVK_ANSI_9), label: "9"),
+            binding("A9", keyCode: UInt32(kVK_ANSI_9), label: "9")
+        ]).map(\.target.name)
+        if tie != ["A9", "B9"] {
+            failures.append("equal shortcuts did not fall back to a stable name order: \(tie)")
+        }
+
+        let shiftedDigit = binding("Shift4", keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(cmdKey | shiftKey), label: "4")
+        let letters = BindingOrder.sorted([
+            binding("Zed", keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey | shiftKey), label: "Z"),
+            shiftedDigit
+        ]).map(\.target.name)
+        if letters != ["Shift4", "Zed"] {
+            failures.append("shifted digits did not sort with letter shortcuts by label: \(letters)")
         }
     }
 
