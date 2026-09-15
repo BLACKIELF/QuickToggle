@@ -1,0 +1,55 @@
+name: QuickToggle CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS build and checks
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check source and runner
+        run: |
+          test "$(uname -m)" = arm64
+          git diff --check
+          bash -n build.sh selfcheck.sh package.sh
+      - name: Build and run checks
+        run: bash selfcheck.sh
+      - name: Build release package
+        run: bash package.sh
+      - name: Verify release contents
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import zipfile
+
+          version = Path("VERSION").read_text().strip()
+          archive = Path("build/package") / f"QuickToggle-{version}-macOS-arm64.zip"
+          with zipfile.ZipFile(archive) as package:
+              assert package.testzip() is None, "Damaged archive"
+              info = plistlib.loads(package.read("QuickToggle.app/Contents/Info.plist"))
+              assert info["CFBundleShortVersionString"] == version
+              assert info["CFBundleIdentifier"] == "com.quicktoggle.app"
+              revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              assert info["QuickToggleSourceRevision"] == revision
+          print(f"Verified QuickToggle {version} release archive")
+          PY
