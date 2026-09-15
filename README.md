@@ -22,7 +22,7 @@ open "build/preview/QuickToggle.app"
 ## 下载与运行
 
 - Apple Silicon Mac，macOS 13 或更高版本。
-- 1.0 当前通过源码构建；已公开的旧版安装包见 [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest)。以 Release 页面标注的版本为准。
+- 下载 [轻唤 1.0.0](https://github.com/BLACKIELF/QuickToggle/releases/tag/v1.0.0) 中的 `QuickToggle-1.0.0-macOS-arm64.zip`。
 - 默认构建使用 ad-hoc 签名；若本机已有开发证书则复用该证书。构建产物未经 Apple 公证，不会自动安装到 `/Applications`。首次运行若被 Gatekeeper 拦截，请在“系统设置 > 隐私与安全性”中确认打开；不放心时请直接从源码构建。
 
 从源码构建需要 Xcode Command Line Tools：
@@ -126,7 +126,7 @@ Source version: `1.0.0` (QuickToggle 1.0).
 ### Download and run
 
 - Apple Silicon Mac with macOS 13 or later.
-- Build 1.0 from source. Previously published binaries are listed under [Releases](https://github.com/BLACKIELF/QuickToggle/releases/latest); check the version shown there.
+- Download `QuickToggle-1.0.0-macOS-arm64.zip` from [QuickToggle 1.0.0](https://github.com/BLACKIELF/QuickToggle/releases/tag/v1.0.0).
 - Builds use ad-hoc signing unless a local development certificate is available. They are not Apple-notarized. It is not installed into `/Applications` automatically. If Gatekeeper blocks the first launch, explicitly allow it in System Settings > Privacy & Security, or build from source.
 
 Building from source requires Xcode Command Line Tools:
