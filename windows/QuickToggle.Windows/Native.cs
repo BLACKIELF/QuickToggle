@@ -6,6 +6,7 @@ namespace QuickToggle;
 
 internal static class Native
 {
+    [DllImport("user32.dll")] internal static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint key);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)]
@@ -144,7 +145,8 @@ internal sealed class ToggleEngine : IDisposable
 
     private static IntPtr FindWindow(AppBinding app)
     {
-        var matches = Native.Windows().Where(window => string.Equals(window.Path, app.Executable, StringComparison.OrdinalIgnoreCase)).ToArray();
+        string executable = Path.GetFullPath(app.Executable);
+        var matches = Native.Windows().Where(window => string.Equals(window.Path, executable, StringComparison.OrdinalIgnoreCase)).ToArray();
         IntPtr foreground = Native.GetForegroundWindow();
         return matches.Any(window => window.Window == foreground) ? foreground : matches.FirstOrDefault().Window;
     }
@@ -153,7 +155,7 @@ internal sealed class ToggleEngine : IDisposable
     {
         if (!Native.IsWindow(target)) return "应用窗口已关闭，请重试。";
         Native.GetWindowThreadProcessId(target, out uint targetPid);
-        if (!string.Equals(Native.ProcessPath(targetPid), app.Executable, StringComparison.OrdinalIgnoreCase)) return "应用窗口已变化，请重试。";
+        if (!string.Equals(Native.ProcessPath(targetPid), Path.GetFullPath(app.Executable), StringComparison.OrdinalIgnoreCase)) return "应用窗口已变化，请重试。";
         var foreground = WindowIdentity.Capture(Native.GetForegroundWindow());
         if (foreground?.ProcessId == targetPid)
         {

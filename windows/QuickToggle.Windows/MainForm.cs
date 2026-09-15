@@ -200,7 +200,7 @@ internal sealed class MainForm : Form
     private void EditApplication()
     {
         if (Selected() is not AppBinding app) return;
-        using var dialog = new BindingDialog(app);
+        using var dialog = new BindingDialog(app, Settings.SettingsHotkey);
         if (dialog.ShowDialog(this) == DialogResult.OK && dialog.Result is AppBinding result)
             Change(candidate => candidate.Apps[candidate.Apps.FindIndex(item => item.Id == app.Id)] = result, "已更新应用。");
     }

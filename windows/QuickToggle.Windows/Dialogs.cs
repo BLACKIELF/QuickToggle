@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.ComponentModel;
 using Microsoft.Win32;
 
 namespace QuickToggle;
@@ -76,11 +77,14 @@ internal sealed class BindingDialog : Form
     private readonly TextBox arguments = new() { Dock = DockStyle.Fill };
     private readonly CheckBox launch = new() { Text = "未运行时允许启动", AutoSize = true };
     private readonly AppBinding original;
+    private readonly Shortcut settingsHotkey;
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public AppBinding? Result { get; private set; }
 
-    public BindingDialog(AppBinding binding)
+    public BindingDialog(AppBinding binding, Shortcut settingsHotkey)
     {
         original = binding;
+        this.settingsHotkey = settingsHotkey;
         Text = "编辑应用";
         ClientSize = new(620, 250);
         MinimumSize = new(520, 290);
@@ -112,7 +116,7 @@ internal sealed class BindingDialog : Form
             try
             {
                 var candidate = new AppBinding { Id = original.Id, Name = name.Text.Trim(), Executable = executable.Text.Trim(), Arguments = arguments.Text, LaunchIfNeeded = launch.Checked, Hotkey = original.Hotkey };
-                new AppSettings { Apps = [candidate] }.Validate();
+                new AppSettings { Apps = [candidate], SettingsHotkey = this.settingsHotkey }.Validate();
                 if (!File.Exists(candidate.Executable)) throw new IOException("找不到应用文件，请重新选择。");
                 Result = candidate; DialogResult = DialogResult.OK; Close();
             }
@@ -126,6 +130,7 @@ internal sealed class ShortcutDialog : Form
 {
     private readonly Label value = new() { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter };
     private readonly Button save = new() { Text = "使用此快捷键", AutoSize = true };
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Shortcut? Result { get; private set; }
     public ShortcutDialog(Shortcut? initial, bool allowClear)
     {
@@ -148,7 +153,10 @@ internal sealed class ShortcutDialog : Form
     protected override bool ProcessCmdKey(ref Message message, Keys keyData)
     {
         if (keyData == Keys.Escape) { DialogResult = DialogResult.Cancel; Close(); return true; }
+        if (keyData == Keys.Enter && save.Enabled) { save.PerformClick(); return true; }
         if (keyData == Keys.Tab || keyData == (Keys.Shift | Keys.Tab)) return base.ProcessCmdKey(ref message, keyData);
+        if ((Native.GetAsyncKeyState((int)Keys.LWin) & 0x8000) != 0 || (Native.GetAsyncKeyState((int)Keys.RWin) & 0x8000) != 0)
+        { value.Text = "Win 组合由系统保留，请使用 Ctrl 或 Alt。"; save.Enabled = false; return true; }
         if ((keyData & Keys.KeyCode) is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin) return true;
         var shortcut = Shortcut.FromKeyData(keyData);
         string? error = shortcut.Validate();

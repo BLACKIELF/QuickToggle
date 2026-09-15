@@ -1,4 +1,5 @@
 using System.Drawing.Imaging;
+using System.Diagnostics;
 
 namespace QuickToggle;
 
@@ -129,6 +130,47 @@ internal static class SelfTests
                 Check(second.Register(701, available!) is null, "native shortcut not released");
             }
             finally { first.Unregister(700); second.Unregister(701); }
+        });
+        Test("native window discovery, restore and minimize", () =>
+        {
+            string executable = Environment.ProcessPath!;
+            string entry = Environment.GetCommandLineArgs()[0];
+            var start = new ProcessStartInfo(executable) { UseShellExecute = false };
+            if (entry.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) start.ArgumentList.Add(entry);
+            start.ArgumentList.Add("--test-window");
+            using var helper = Process.Start(start) ?? throw new InvalidOperationException("test window launch failed");
+            try
+            {
+                IntPtr window = IntPtr.Zero;
+                for (int attempt = 0; attempt < 100; attempt++)
+                {
+                    window = Native.Windows().FirstOrDefault(item => item.ProcessId == helper.Id).Window;
+                    if (window != IntPtr.Zero) break;
+                    Thread.Sleep(100);
+                }
+                Check(window != IntPtr.Zero, "visible window discovery");
+                var identity = WindowIdentity.Capture(window);
+                Check(identity is not null && identity.StillValid(), "window identity");
+                Check(string.Equals(Native.ProcessPath((uint)helper.Id), executable, StringComparison.OrdinalIgnoreCase), "process path");
+                Native.ShowWindowAsync(window, 6);
+                Check(SpinWait.SpinUntil(() => Native.IsIconic(window), 3000), "native minimize");
+                using var engine = new ToggleEngine();
+                string feedback = engine.ToggleAsync(new AppBinding { Name = "Test", Executable = executable, LaunchIfNeeded = false }).GetAwaiter().GetResult();
+                Check(!feedback.Contains("没有可切换"), "engine failed to find helper");
+                Check(SpinWait.SpinUntil(() => !Native.IsIconic(window), 3000), "engine restore");
+                if (Native.SetForegroundWindow(window))
+                {
+                    Check(SpinWait.SpinUntil(() => Native.GetForegroundWindow() == window, 3000), "foreground transition");
+                    feedback = engine.ToggleAsync(new AppBinding { Name = "Test", Executable = executable }).GetAwaiter().GetResult();
+                    Check(feedback.Contains("最小化"), "foreground toggle route");
+                    Check(SpinWait.SpinUntil(() => Native.IsIconic(window), 3000), "engine minimize");
+                }
+                else Console.WriteLine("INFO runner denied foreground activation; manual focus acceptance remains pending");
+            }
+            finally
+            {
+                if (!helper.HasExited) { helper.CloseMainWindow(); if (!helper.WaitForExit(3000)) { helper.Kill(); helper.WaitForExit(); } }
+            }
         });
         Console.WriteLine($"Self-tests: {passed} passed, {failed} failed; {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}");
         return failed == 0 ? 0 : 1;

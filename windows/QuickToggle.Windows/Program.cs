@@ -11,6 +11,13 @@ internal static class Program
     private static int Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        if (args.Contains("--test-window"))
+        {
+            using var window = new Form { Text = "QuickToggle native test window", Size = new(360, 220) };
+            using var timer = new System.Windows.Forms.Timer { Interval = 20000 };
+            timer.Tick += (_, _) => window.Close(); timer.Start();
+            Application.Run(window); return 0;
+        }
         if (args.Contains("--self-test")) return SelfTests.Run();
         if (args.Contains("--ui-smoke-test")) return SelfTests.UI(args.SkipWhile(arg => arg != "--ui-smoke-test").Skip(1).FirstOrDefault());
         string sid = WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName;
