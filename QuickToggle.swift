@@ -1,9 +1,12 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import Darwin
 import Foundation
 import ServiceManagement
 import UniformTypeIdentifiers
+
+private let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
 
 // MARK: - Persisted model
 
@@ -24,6 +27,67 @@ private func shortcutIsUsed(_ shortcut: Shortcut, in bindings: [AppBinding], exc
     bindings.contains { $0.id != id && $0.shortcut == shortcut }
 }
 
+private let fnModifierMask = UInt32(NSEvent.ModifierFlags.function.rawValue)
+
+private enum SystemKeyboardOverlap {
+    enum GlobePressAction: Equatable {
+        case none
+        case switchInputSource
+        case emojiAndSymbols
+        case dictation
+        case unknown(Int)
+
+        var conflictDescription: String? {
+            switch self {
+            case .none: return nil
+            case .switchInputSource: return "切换输入法"
+            case .emojiAndSymbols: return "显示表情与符号"
+            case .dictation: return "开始听写"
+            case .unknown(let value): return "未知动作（值 \(value)）"
+            }
+        }
+    }
+
+    static func globePressAction(from value: Any?) -> GlobePressAction {
+        guard let number = value as? NSNumber else { return .none }
+        switch number.intValue {
+        case 0: return .none
+        case 1: return .switchInputSource
+        case 2: return .emojiAndSymbols
+        case 3: return .dictation
+        default: return .unknown(number.intValue)
+        }
+    }
+
+    static var globePressAction: GlobePressAction {
+        globePressAction(
+            from: UserDefaults(suiteName: "com.apple.HIToolbox")?.object(forKey: "AppleFnUsageType")
+        )
+    }
+
+    static func standardFunctionKeyModeDescription(from value: Any?) -> String {
+        guard let number = value as? NSNumber else {
+            return "未显式设置（通常由顶部功能图标优先）"
+        }
+        return number.boolValue
+            ? "已开启“将 F1、F2 等键用作标准功能键”"
+            : "已关闭“将 F1、F2 等键用作标准功能键”"
+    }
+
+    static var standardFunctionKeyModeDescription: String {
+        standardFunctionKeyModeDescription(
+            from: UserDefaults.standard.object(forKey: "com.apple.keyboard.fnState")
+        )
+    }
+
+    static func warning(for shortcut: Shortcut) -> String? {
+        guard shortcut.isFunctionDigit else { return nil }
+        let base = "fn/🌐 + 数字通过事件 tap 监听；macOS 无法检测所有系统、应用或键盘固件冲突。"
+        guard let action = globePressAction.conflictDescription else { return base }
+        return "系统已把单按 fn/🌐 配置为“\(action)”，组合键可能不可达或同时触发系统行为。\(base)"
+    }
+}
+
 private struct Shortcut: Codable, Equatable {
     let keyCode: UInt32
     let modifiers: UInt32
@@ -31,6 +95,7 @@ private struct Shortcut: Codable, Equatable {
 
     var displayName: String {
         var result = ""
+        if modifiers & fnModifierMask != 0 { result += "fn" }
         if modifiers & UInt32(controlKey) != 0 { result += "⌃" }
         if modifiers & UInt32(optionKey) != 0 { result += "⌥" }
         if modifiers & UInt32(shiftKey) != 0 { result += "⇧" }
@@ -39,44 +104,52 @@ private struct Shortcut: Codable, Equatable {
     }
 
     var validationError: String? {
-        let count = [cmdKey, controlKey, optionKey, shiftKey]
-            .filter { modifiers & UInt32($0) != 0 }
-            .count
+        let count = modifierCount
         if count <= 1 { return settingsValidationError }
         return validationError(minimumModifierCount: 2)
     }
 
     var settingsValidationError: String? {
-        let count = [cmdKey, controlKey, optionKey, shiftKey]
-            .filter { modifiers & UInt32($0) != 0 }
-            .count
+        if usesFunctionModifier { return validationError(minimumModifierCount: 1) }
+        let count = modifierCount
         if count == 1,
-           !(modifiers == UInt32(cmdKey) && Self.numberKeyCodes.contains(keyCode)) {
-            return "单修饰键仅支持 Command + 数字；其他组合请至少使用两个修饰键。"
+           !(modifiers == UInt32(cmdKey) && Self.numberKeyCodes.contains(keyCode)),
+           !isFunctionDigit {
+            return "单修饰键仅支持 Command + 数字或 fn/🌐 + 数字；其他组合请至少使用两个修饰键。"
         }
         return validationError(minimumModifierCount: 1)
     }
 
     private func validationError(minimumModifierCount: Int) -> String? {
-        let count = [cmdKey, controlKey, optionKey, shiftKey]
-            .filter { modifiers & UInt32($0) != 0 }
-            .count
+        let count = modifierCount
         guard count >= minimumModifierCount else {
             return minimumModifierCount == 1
                 ? "快捷键至少需要一个修饰键。"
                 : "快捷键至少需要两个修饰键。"
         }
-        guard modifiers & UInt32(cmdKey | controlKey) != 0 else {
-            return "快捷键必须包含 Command 或 Control。"
-        }
         guard Self.supportedKeyCodes.contains(keyCode) else {
             return "请选择字母、数字、方向键或 F1–F12。"
+        }
+        if usesFunctionModifier {
+            guard modifiers == fnModifierMask else {
+                return "fn/🌐 目前仅支持单独搭配数字，不与其他修饰键叠加。"
+            }
+            if isReserved { return "该 fn/🌐 组合由 macOS 保留，请选择 fn/🌐 + 数字。" }
+            if isFunctionDigit { return nil }
+            if Self.functionKeyCodes.contains(keyCode) {
+                return "暂不支持 fn/🌐 + F1–F12；该键受“将 F1、F2 等键用作标准功能键”影响，当前：\(SystemKeyboardOverlap.standardFunctionKeyModeDescription)。"
+            }
+            return "fn/🌐 单修饰键仅支持数字 0–9。"
+        }
+        guard modifiers & UInt32(cmdKey | controlKey) != 0 else {
+            return "快捷键必须包含 Command 或 Control。"
         }
         guard !isReserved else { return "该组合由 macOS 保留，请选择其他快捷键。" }
         return nil
     }
 
     var riskWarning: String? {
+        if let warning = SystemKeyboardOverlap.warning(for: self) { return warning }
         if modifiers == UInt32(cmdKey), Self.numberKeyCodes.contains(keyCode) {
             return "⌘ + 数字在部分应用中用于切换标签页；已保存，但 macOS 无法检测所有非独占冲突。"
         }
@@ -88,11 +161,14 @@ private struct Shortcut: Codable, Equatable {
     }
 
     private var isReserved: Bool {
+        let hasFunction = usesFunctionModifier
         let hasCommand = modifiers & UInt32(cmdKey) != 0
         let hasControl = modifiers & UInt32(controlKey) != 0
         let hasOption = modifiers & UInt32(optionKey) != 0
         let hasShift = modifiers & UInt32(shiftKey) != 0
 
+        if hasFunction && [kVK_ANSI_Q, kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow]
+            .map(UInt32.init).contains(keyCode) { return true }
         if hasControl && hasOption { return true }
         if hasCommand && (keyCode == UInt32(kVK_Tab) || keyCode == UInt32(kVK_Space)) { return true }
         if hasCommand && hasShift && [kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5]
@@ -106,6 +182,7 @@ private struct Shortcut: Codable, Equatable {
     static func from(event: NSEvent) -> Shortcut? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var modifiers: UInt32 = 0
+        if flags.contains(.function) { modifiers |= fnModifierMask }
         if flags.contains(.command) { modifiers |= UInt32(cmdKey) }
         if flags.contains(.option) { modifiers |= UInt32(optionKey) }
         if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
@@ -136,6 +213,24 @@ private struct Shortcut: Codable, Equatable {
         kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9
     ].map(UInt32.init))
 
+    private static let functionKeyCodes = Set([
+        kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6,
+        kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12
+    ].map(UInt32.init))
+
+    var usesFunctionModifier: Bool { modifiers & fnModifierMask != 0 }
+    var isFunctionDigit: Bool {
+        modifiers == fnModifierMask && Self.numberKeyCodes.contains(keyCode)
+    }
+
+    private var modifierCount: Int {
+        var count = [cmdKey, controlKey, optionKey, shiftKey]
+            .filter { modifiers & UInt32($0) != 0 }
+            .count
+        if usesFunctionModifier { count += 1 }
+        return count
+    }
+
     private static let keyLabels: [UInt32: String] = [
         UInt32(kVK_LeftArrow): "←", UInt32(kVK_RightArrow): "→",
         UInt32(kVK_UpArrow): "↑", UInt32(kVK_DownArrow): "↓",
@@ -144,6 +239,41 @@ private struct Shortcut: Codable, Equatable {
         UInt32(kVK_F7): "F7", UInt32(kVK_F8): "F8", UInt32(kVK_F9): "F9",
         UInt32(kVK_F10): "F10", UInt32(kVK_F11): "F11", UInt32(kVK_F12): "F12"
     ]
+}
+
+private struct ShortcutConflictRecord: Codable, Equatable {
+    let application: String
+    let command: String
+    let applicationVersion: String
+    let macOSVersion: String
+    let verifiedAt: Date
+    let result: String
+}
+
+private typealias ShortcutConflictKnowledge = [String: [ShortcutConflictRecord]]
+
+private enum ShortcutConflictKnowledgeBase {
+    static func key(for shortcut: Shortcut) -> String {
+        "v1:\(shortcut.modifiers):\(shortcut.keyCode)"
+    }
+
+    static func records(
+        for shortcut: Shortcut,
+        in knowledge: ShortcutConflictKnowledge
+    ) -> [ShortcutConflictRecord] {
+        knowledge[key(for: shortcut)] ?? []
+    }
+
+    static func warning(
+        for shortcut: Shortcut,
+        in knowledge: ShortcutConflictKnowledge
+    ) -> String? {
+        let messages = records(for: shortcut, in: knowledge).map {
+            "此组合在 \($0.application) 中是 \($0.command) 功能"
+        }
+        guard !messages.isEmpty else { return nil }
+        return messages.joined(separator: "；") + "。"
+    }
 }
 
 private final class PreferenceStore {
@@ -157,6 +287,7 @@ private final class PreferenceStore {
         static let importedVerifiedLaunchIDs = "quickToggle.importedVerifiedLaunchIDs"
         static let importedSuggestedAppIDs = "quickToggle.importedSuggestedAppIDs"
         static let occupiedHotKeys = "quickToggle.occupiedHotKeys"
+        static let shortcutConflictKnowledge = "quickToggle.shortcutConflictKnowledge"
     }
 
     private let defaults: UserDefaults
@@ -227,6 +358,14 @@ private final class PreferenceStore {
 
     func saveOccupiedHotKeys(_ entries: [OccupiedHotKeyEntry]) {
         encode(entries, forKey: Key.occupiedHotKeys)
+    }
+
+    func loadShortcutConflictKnowledge() -> ShortcutConflictKnowledge {
+        decode(ShortcutConflictKnowledge.self, forKey: Key.shortcutConflictKnowledge) ?? [:]
+    }
+
+    func saveShortcutConflictKnowledge(_ knowledge: ShortcutConflictKnowledge) {
+        encode(knowledge, forKey: Key.shortcutConflictKnowledge)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
@@ -520,13 +659,17 @@ private enum BindingOrder {
 
     private static func sortKey(shortcut: Shortcut?, name: String) -> SortKey {
         guard let shortcut else {
-            return SortKey(rank: 2, number: Int.max, label: "", name: name)
+            return SortKey(rank: 3, number: Int.max, label: "", name: name)
         }
         if shortcut.modifiers == UInt32(cmdKey),
            let digit = digitKeyCodes.firstIndex(of: shortcut.keyCode) {
             return SortKey(rank: 0, number: digit, label: "", name: name)
         }
-        return SortKey(rank: 1, number: Int.max, label: shortcut.label, name: name)
+        if shortcut.isFunctionDigit,
+           let digit = digitKeyCodes.firstIndex(of: shortcut.keyCode) {
+            return SortKey(rank: 1, number: digit, label: "", name: name)
+        }
+        return SortKey(rank: 2, number: Int.max, label: shortcut.label, name: name)
     }
 
     static func sorted(_ bindings: [AppBinding]) -> [AppBinding] {
@@ -545,6 +688,10 @@ private enum ShortcutSuggester {
         (UInt32(kVK_ANSI_7), "7"), (UInt32(kVK_ANSI_8), "8"), (UInt32(kVK_ANSI_9), "9")
     ]
 
+    static let functionDigits: [(keyCode: UInt32, label: String)] = commandDigits + [
+        (UInt32(kVK_ANSI_0), "0")
+    ]
+
     static func nextFreeCommandDigit(
         bindings: [AppBinding],
         occupied: [OccupiedHotKeyEntry],
@@ -558,6 +705,37 @@ private enum ShortcutSuggester {
             return candidate
         }
         return nil
+    }
+
+    static func nextFreeFunctionDigit(
+        bindings: [AppBinding],
+        occupied: [OccupiedHotKeyEntry],
+        settingsShortcut: Shortcut?
+    ) -> Shortcut? {
+        for (keyCode, label) in functionDigits {
+            let candidate = Shortcut(keyCode: keyCode, modifiers: fnModifierMask, label: label)
+            if OccupiedHotKeys.owner(of: candidate, in: occupied) != nil { continue }
+            if bindings.contains(where: { $0.shortcut == candidate }) { continue }
+            if settingsShortcut == candidate { continue }
+            return candidate
+        }
+        return nil
+    }
+
+    static func nextFreeRecommendedDigit(
+        bindings: [AppBinding],
+        occupied: [OccupiedHotKeyEntry],
+        settingsShortcut: Shortcut?
+    ) -> Shortcut? {
+        nextFreeCommandDigit(
+            bindings: bindings,
+            occupied: occupied,
+            settingsShortcut: settingsShortcut
+        ) ?? nextFreeFunctionDigit(
+            bindings: bindings,
+            occupied: occupied,
+            settingsShortcut: settingsShortcut
+        )
     }
 }
 
@@ -1091,7 +1269,7 @@ private final class PendingApplicationPickerController: NSViewController, NSSear
         countLabel.textColor = .secondaryLabelColor
         countLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "双击添加，不会自动设置快捷键。")
+        let hint = NSTextField(labelWithString: "双击添加，自动分配可用快捷键。")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -1227,7 +1405,208 @@ private final class PendingApplicationPickerController: NSViewController, NSSear
 
 private enum HotKeyFailure: Error, Equatable {
     case occupied
+    case permissionDenied
     case failed
+}
+
+private enum FunctionEventTapState: Equatable {
+    case idle
+    case active
+    case permissionDenied
+    case unavailable
+    case disabled
+}
+
+private func functionEventTapCallback(
+    _ proxy: CGEventTapProxy,
+    _ type: CGEventType,
+    _ event: CGEvent,
+    _ userData: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let userData else { return Unmanaged.passUnretained(event) }
+    let center = Unmanaged<FunctionHotKeyCenter>.fromOpaque(userData).takeUnretainedValue()
+    return center.handle(type: type, event: event) ? nil : Unmanaged.passUnretained(event)
+}
+
+private final class FunctionHotKeyCenter {
+    struct Entry {
+        let shortcut: Shortcut
+        let onKeyDown: () -> Void
+        let onKeyUp: () -> Void
+    }
+
+    static let shared = FunctionHotKeyCenter()
+
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var entries: [UUID: Entry] = [:]
+    private var pressedTokensByKeyCode: [UInt32: Set<UUID>] = [:]
+    private(set) var state: FunctionEventTapState = .idle
+
+    var activeRegistrationCount: Int { entries.count }
+
+    static func hasExactFunctionModifier(_ flags: CGEventFlags) -> Bool {
+        guard flags.contains(.maskSecondaryFn) else { return false }
+        let otherModifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+        return flags.intersection(otherModifiers).isEmpty
+    }
+
+    func register(
+        _ shortcut: Shortcut,
+        onKeyDown: @escaping () -> Void,
+        onKeyUp: @escaping () -> Void
+    ) -> Result<UUID, HotKeyFailure> {
+        guard shortcut.isFunctionDigit else { return .failure(.failed) }
+        if entries.values.contains(where: { $0.shortcut == shortcut }) {
+            return .failure(.occupied)
+        }
+        switch ensureTap(requestPermission: true) {
+        case .failure(let error): return .failure(error)
+        case .success: break
+        }
+        let token = UUID()
+        entries[token] = Entry(shortcut: shortcut, onKeyDown: onKeyDown, onKeyUp: onKeyUp)
+        return .success(token)
+    }
+
+    func probe(_ shortcut: Shortcut) -> Result<Void, HotKeyFailure> {
+        guard shortcut.isFunctionDigit else { return .failure(.failed) }
+        if entries.values.contains(where: { $0.shortcut == shortcut }) {
+            return .failure(.occupied)
+        }
+        let result = ensureTap(requestPermission: true)
+        if entries.isEmpty, case .success = result { stopTap(nextState: .idle) }
+        return result
+    }
+
+    func unregister(_ token: UUID) -> Result<Void, HotKeyFailure> {
+        guard entries.removeValue(forKey: token) != nil else { return .success(()) }
+        for keyCode in Array(pressedTokensByKeyCode.keys) {
+            pressedTokensByKeyCode[keyCode]?.remove(token)
+            if pressedTokensByKeyCode[keyCode]?.isEmpty == true {
+                pressedTokensByKeyCode.removeValue(forKey: keyCode)
+            }
+        }
+        if entries.isEmpty { stopTap(nextState: .idle) }
+        return .success(())
+    }
+
+    func diagnosticDescription(configuredCount: Int) -> String {
+        if configuredCount == 0 {
+            switch state {
+            case .permissionDenied: return "Fn 通道失败：辅助功能未授权"
+            case .unavailable: return "Fn 通道失败：事件监听不可用"
+            case .disabled: return "Fn 通道失败：事件监听已停用"
+            case .idle, .active: return "Fn 通道未使用"
+            }
+        }
+        switch state {
+        case .active:
+            return "Fn 通道 \(activeRegistrationCount)/\(configuredCount) 已监听"
+        case .permissionDenied:
+            return "Fn 通道失败：辅助功能未授权"
+        case .unavailable:
+            return "Fn 通道失败：事件监听不可用"
+        case .disabled:
+            return "Fn 通道失败：事件监听已停用"
+        case .idle:
+            return "Fn 通道待启用"
+        }
+    }
+
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            releaseAllPressedKeys()
+            state = .disabled
+            if let eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+                state = CGEvent.tapIsEnabled(tap: eventTap) ? .active : .disabled
+            }
+            return false
+        }
+
+        let keyCode = UInt32(event.getIntegerValueField(.keyboardEventKeycode))
+        switch type {
+        case .keyDown:
+            if let tokens = pressedTokensByKeyCode[keyCode], !tokens.isEmpty {
+                for token in tokens { entries[token]?.onKeyDown() }
+                return true
+            }
+            guard Self.hasExactFunctionModifier(event.flags) else { return false }
+            let matches = entries.filter { $0.value.shortcut.keyCode == keyCode }
+            guard !matches.isEmpty else { return false }
+            for (token, entry) in matches {
+                pressedTokensByKeyCode[keyCode, default: []].insert(token)
+                entry.onKeyDown()
+            }
+            return true
+        case .keyUp:
+            guard let tokens = pressedTokensByKeyCode.removeValue(forKey: keyCode), !tokens.isEmpty else {
+                return false
+            }
+            for token in tokens { entries[token]?.onKeyUp() }
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func ensureTap(requestPermission: Bool) -> Result<Void, HotKeyFailure> {
+        if let eventTap, CGEvent.tapIsEnabled(tap: eventTap) {
+            state = .active
+            return .success(())
+        }
+        if eventTap != nil { stopTap(nextState: .disabled) }
+        guard Accessibility.isTrusted else {
+            if requestPermission { Accessibility.request() }
+            state = .permissionDenied
+            return .failure(.permissionDenied)
+        }
+
+        let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << CGEventType.keyUp.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: functionEventTapCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            state = .unavailable
+            return .failure(.failed)
+        }
+        eventTap = tap
+        runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        guard CGEvent.tapIsEnabled(tap: tap) else {
+            stopTap(nextState: .disabled)
+            return .failure(.failed)
+        }
+        state = .active
+        return .success(())
+    }
+
+    private func releaseAllPressedKeys() {
+        let tokens = Set(pressedTokensByKeyCode.values.flatMap { $0 })
+        pressedTokensByKeyCode.removeAll()
+        for token in tokens { entries[token]?.onKeyUp() }
+    }
+
+    private func stopTap(nextState: FunctionEventTapState) {
+        releaseAllPressedKeys()
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+        if let eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+        }
+        runLoopSource = nil
+        eventTap = nil
+        state = nextState
+    }
 }
 
 private enum RegistrationTransaction {
@@ -1264,34 +1643,92 @@ private func carbonHotKeyCallback(
     return manager.handle(event)
 }
 
+private struct HotKeyPressState {
+    private(set) var isPressed = false
+
+    mutating func acceptPress() -> Bool {
+        guard !isPressed else { return false }
+        isPressed = true
+        return true
+    }
+
+    mutating func release() {
+        isPressed = false
+    }
+
+    mutating func reset() {
+        isPressed = false
+    }
+}
+
+private struct HotKeyGenerationState {
+    private(set) var generation: UInt64 = 0
+    private(set) var isActive = false
+
+    var nextGeneration: UInt64 { generation &+ 1 }
+
+    mutating func activate(_ candidate: UInt64) {
+        generation = candidate
+        isActive = true
+    }
+
+    mutating func invalidate() {
+        generation &+= 1
+        isActive = false
+    }
+
+    func accepts(_ candidate: UInt64) -> Bool {
+        isActive && generation == candidate
+    }
+}
+
 private final class HotKeyManager {
+    private enum Reference {
+        case carbon(EventHotKeyRef)
+        case function(UUID)
+    }
+
     private static var signatureSeed: OSType = 0x51540000
     var onPress: (() -> Void)?
-    private var reference: EventHotKeyRef?
+    private var reference: Reference?
     private var handler: EventHandlerRef?
     private var activeShortcut: Shortcut?
     private var nextIdentifier: UInt32 = 1
+    private var pressState = HotKeyPressState()
+    private var generationState = HotKeyGenerationState()
     private let signature: OSType
 
     init() {
         Self.signatureSeed &+= 1
         signature = Self.signatureSeed
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
-        let status = InstallEventHandler(
-            GetApplicationEventTarget(),
-            carbonHotKeyCallback,
-            1,
-            &eventType,
-            Unmanaged.passUnretained(self).toOpaque(),
-            &handler
-        )
+        let eventTypes = [
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyPressed)
+            ),
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyReleased)
+            )
+        ]
+        let status = eventTypes.withUnsafeBufferPointer { events in
+            InstallEventHandler(
+                GetApplicationEventTarget(),
+                carbonHotKeyCallback,
+                events.count,
+                events.baseAddress,
+                Unmanaged.passUnretained(self).toOpaque(),
+                &handler
+            )
+        }
         if status != noErr { handler = nil }
     }
 
-    var isActive: Bool { reference != nil }
+    deinit {
+        close()
+    }
+
+    var isActive: Bool { reference != nil && generationState.isActive }
     var routingSignature: OSType { signature }
 
     static func routes(eventSignature: OSType, to managerSignature: OSType) -> Bool {
@@ -1313,24 +1750,36 @@ private final class HotKeyManager {
         guard status == noErr, Self.routes(eventSignature: identifier.signature, to: signature) else {
             return OSStatus(eventNotHandledErr)
         }
-        DispatchQueue.main.async { [weak self] in self?.onPress?() }
-        return noErr
+        switch GetEventKind(event) {
+        case UInt32(kEventHotKeyPressed):
+            guard pressState.acceptPress() else { return noErr }
+            let generation = generationState.generation
+            DispatchQueue.main.async { [weak self] in self?.deliverPress(generation: generation) }
+            return noErr
+        case UInt32(kEventHotKeyReleased):
+            pressState.release()
+            return noErr
+        default:
+            return OSStatus(eventNotHandledErr)
+        }
     }
 
     func replace(with shortcut: Shortcut) -> Result<Void, HotKeyFailure> {
-        guard handler != nil else { return .failure(.failed) }
+        guard shortcut.isFunctionDigit || handler != nil else { return .failure(.failed) }
         if activeShortcut == shortcut, reference != nil { return .success(()) }
 
-        let result: Result<EventHotKeyRef, HotKeyFailure> = RegistrationTransaction.replace(
+        let candidateGeneration = generationState.nextGeneration
+
+        let result: Result<Reference, HotKeyFailure> = RegistrationTransaction.replace(
             current: reference,
             registerCandidate: { [weak self] in
                 guard let self else { return .failure(.failed) }
-                return self.register(shortcut)
+                return self.register(shortcut, generation: candidateGeneration)
             },
-            unregister: { ref in
-                UnregisterEventHotKey(ref) == noErr ? .success(()) : .failure(.failed)
+            unregister: { [weak self] reference in
+                self?.unregister(reference) ?? .failure(.failed)
             },
-            rollbackCandidate: { _ = UnregisterEventHotKey($0) }
+            rollbackCandidate: { [weak self] reference in _ = self?.unregister(reference) }
         )
 
         switch result {
@@ -1338,12 +1787,18 @@ private final class HotKeyManager {
         case .success(let newReference):
             reference = newReference
             activeShortcut = shortcut
+            pressState.reset()
+            generationState.activate(candidateGeneration)
             return .success(())
         }
     }
 
     func probe(_ shortcut: Shortcut) -> Result<Void, HotKeyFailure> {
-        switch register(shortcut) {
+        if shortcut.usesFunctionModifier {
+            guard shortcut.isFunctionDigit else { return .failure(.failed) }
+            return FunctionHotKeyCenter.shared.probe(shortcut)
+        }
+        switch registerCarbon(shortcut) {
         case .failure(let error): return .failure(error)
         case .success(let candidate):
             return UnregisterEventHotKey(candidate) == noErr ? .success(()) : .failure(.failed)
@@ -1351,19 +1806,27 @@ private final class HotKeyManager {
     }
 
     func disable() -> Result<Void, HotKeyFailure> {
-        guard let reference else { return .success(()) }
-        guard UnregisterEventHotKey(reference) == noErr else { return .failure(.failed) }
+        guard let reference else {
+            pressState.reset()
+            generationState.invalidate()
+            return .success(())
+        }
+        guard case .success = unregister(reference) else { return .failure(.failed) }
         self.reference = nil
         activeShortcut = nil
+        pressState.reset()
+        generationState.invalidate()
         return .success(())
     }
 
     func rebind(_ shortcut: Shortcut) -> Result<Void, HotKeyFailure> {
         if let reference {
-            _ = UnregisterEventHotKey(reference)
+            _ = unregister(reference)
             self.reference = nil
         }
         activeShortcut = nil
+        pressState.reset()
+        generationState.invalidate()
         return replace(with: shortcut)
     }
 
@@ -1373,7 +1836,19 @@ private final class HotKeyManager {
         handler = nil
     }
 
-    private func register(_ shortcut: Shortcut) -> Result<EventHotKeyRef, HotKeyFailure> {
+    private func register(_ shortcut: Shortcut, generation: UInt64) -> Result<Reference, HotKeyFailure> {
+        if shortcut.usesFunctionModifier {
+            guard shortcut.isFunctionDigit else { return .failure(.failed) }
+            return FunctionHotKeyCenter.shared.register(
+                shortcut,
+                onKeyDown: { [weak self] in self?.handleFunctionKeyDown(generation: generation) },
+                onKeyUp: { [weak self] in self?.handleFunctionKeyUp(generation: generation) }
+            ).map(Reference.function)
+        }
+        return registerCarbon(shortcut).map(Reference.carbon)
+    }
+
+    private func registerCarbon(_ shortcut: Shortcut) -> Result<EventHotKeyRef, HotKeyFailure> {
         nextIdentifier &+= 1
         var candidate: EventHotKeyRef?
         let identifier = EventHotKeyID(signature: signature, id: nextIdentifier)
@@ -1389,6 +1864,30 @@ private final class HotKeyManager {
             return .failure(status == eventHotKeyExistsErr ? .occupied : .failed)
         }
         return .success(candidate)
+    }
+
+    private func unregister(_ reference: Reference) -> Result<Void, HotKeyFailure> {
+        switch reference {
+        case .carbon(let carbonReference):
+            return UnregisterEventHotKey(carbonReference) == noErr ? .success(()) : .failure(.failed)
+        case .function(let token):
+            return FunctionHotKeyCenter.shared.unregister(token)
+        }
+    }
+
+    private func handleFunctionKeyDown(generation: UInt64) {
+        guard generationState.accepts(generation), pressState.acceptPress() else { return }
+        DispatchQueue.main.async { [weak self] in self?.deliverPress(generation: generation) }
+    }
+
+    private func handleFunctionKeyUp(generation: UInt64) {
+        guard generationState.accepts(generation) else { return }
+        pressState.release()
+    }
+
+    private func deliverPress(generation: UInt64) {
+        guard generationState.accepts(generation) else { return }
+        onPress?()
     }
 }
 
@@ -1445,7 +1944,17 @@ private enum RestorePlanner {
 private enum Accessibility {
     static var isTrusted: Bool { AXIsProcessTrusted() }
 
+    /// 自动路径（fn 探测/注册）每次启动最多弹一次系统授权框，避免疯狂弹窗；
+    /// 用户主动点「申请辅助功能权限」走 requestExplicitly()，不受此限。
+    private static var didAutoPrompt = false
+
     static func request() {
+        guard !didAutoPrompt else { return }
+        didAutoPrompt = true
+        requestExplicitly()
+    }
+
+    static func requestExplicitly() {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
@@ -1550,16 +2059,40 @@ private enum WindowPresence {
     }
 }
 
+private struct LaunchAttemptState {
+    private(set) var isLaunching = false
+    private(set) var generation = 0
+
+    mutating func begin() -> Int {
+        generation &+= 1
+        isLaunching = true
+        return generation
+    }
+
+    mutating func complete(_ candidate: Int) -> Bool {
+        guard isLaunching, generation == candidate else { return false }
+        isLaunching = false
+        return true
+    }
+
+    mutating func invalidate(_ candidate: Int? = nil) -> Bool {
+        if let candidate, (!isLaunching || generation != candidate) { return false }
+        generation &+= 1
+        isLaunching = false
+        return true
+    }
+}
+
 private final class ToggleEngine {
     var onStatus: ((String, StatusTone) -> Void)?
     private var session: ToggleSession?
-    private var isLaunching = false
-    private var launchGeneration = 0
+    private var launchAttempt = LaunchAttemptState()
+    private var visibilityAttempt = LaunchAttemptState()
 
     func cancelSession() {
         session = nil
-        isLaunching = false
-        launchGeneration += 1
+        _ = launchAttempt.invalidate()
+        _ = visibilityAttempt.invalidate()
     }
 
     private func say(_ message: String, _ tone: StatusTone = .info) {
@@ -1567,7 +2100,8 @@ private final class ToggleEngine {
     }
 
     func toggle(_ target: TargetApplication, launchIfNeeded: Bool) {
-        guard !isLaunching else {
+        _ = visibilityAttempt.invalidate()
+        guard !launchAttempt.isLaunching else {
             say("目标应用正在启动，请稍候。", .warning)
             return
         }
@@ -1599,11 +2133,10 @@ private final class ToggleEngine {
             let configuration = NSWorkspace.OpenConfiguration()
             configuration.activates = true
             configuration.createsNewApplicationInstance = false
-            beginLaunch()
+            let generation = beginLaunch()
             workspace.openApplication(at: resolvedURL, configuration: configuration) { [weak self] app, error in
                 DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.isLaunching = false
+                    guard let self, self.launchAttempt.complete(generation) else { return }
                     guard let app, error == nil else {
                         self.say("目标应用启动失败。", .error)
                         return
@@ -1625,22 +2158,7 @@ private final class ToggleEngine {
         let previous = previousFrontmostProcessIdentifier(excluding: current.processIdentifier)
         let onScreenWindows = WindowPresence.onScreenCount(for: current.processIdentifier)
         if current.isHidden {
-            _ = current.unhide()
-            guard current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
-                say("无法激活目标应用。", .error)
-                return
-            }
-            if RevealPolicy.shouldReopen(windowCount: WindowPresence.onScreenCount(for: current.processIdentifier)) {
-                reopenRunningApplication(current, previous: previous, target: target)
-                return
-            }
-            session = ToggleSession(
-                targetProcessIdentifier: current.processIdentifier,
-                previousProcessIdentifier: previous,
-                state: .hidden,
-                createdAt: Date()
-            )
-            say("已呼出 \(target.name)；再次按键会恢复隐藏状态。")
+            requestVerifiedReveal(current, previous: previous, target: target)
             return
         }
 
@@ -1648,12 +2166,13 @@ private final class ToggleEngine {
             targetIsFrontmost: appearsFront(current),
             onScreenWindowCount: onScreenWindows
         ) {
-            guard current.hide() else {
-                say("无法隐藏目标应用。", .error)
-                return
-            }
-            activatePrevious(previous)
-            say("\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。")
+            requestVerifiedHide(
+                current,
+                previous: previous,
+                target: target,
+                failureMessage: "无法隐藏目标应用。",
+                successMessage: "\(target.name) 已在前台，现已安全隐藏；没有关闭窗口。"
+            )
             return
         }
 
@@ -1708,6 +2227,146 @@ private final class ToggleEngine {
         say("已呼出 \(target.name)；再次按键会安全隐藏。")
     }
 
+    private func requestVerifiedReveal(
+        _ running: NSRunningApplication,
+        previous: pid_t?,
+        target: TargetApplication
+    ) {
+        let generation = visibilityAttempt.begin()
+        _ = running.unhide()
+        _ = running.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        verifyReveal(
+            processIdentifier: running.processIdentifier,
+            previous: previous,
+            target: target,
+            generation: generation,
+            retriesRemaining: 1,
+            delay: 0.2
+        )
+    }
+
+    private func verifyReveal(
+        processIdentifier: pid_t,
+        previous: pid_t?,
+        target: TargetApplication,
+        generation: Int,
+        retriesRemaining: Int,
+        delay: TimeInterval
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.visibilityAttempt.isLaunching,
+                  self.visibilityAttempt.generation == generation else { return }
+            let refreshed = self.verifiedRunningApplication(
+                processIdentifier,
+                matching: target.bundleIdentifier
+            )
+            if let refreshed, !refreshed.isHidden, refreshed.isActive {
+                guard self.visibilityAttempt.complete(generation) else { return }
+                if RevealPolicy.shouldReopen(
+                    windowCount: WindowPresence.onScreenCount(for: refreshed.processIdentifier)
+                ) {
+                    self.reopenRunningApplication(refreshed, previous: previous, target: target)
+                    return
+                }
+                self.session = ToggleSession(
+                    targetProcessIdentifier: refreshed.processIdentifier,
+                    previousProcessIdentifier: previous,
+                    state: .hidden,
+                    createdAt: Date()
+                )
+                self.say("已呼出 \(target.name)；再次按键会恢复隐藏状态。")
+                return
+            }
+            guard retriesRemaining > 0 else {
+                guard self.visibilityAttempt.complete(generation) else { return }
+                self.say("无法激活目标应用。", .error)
+                return
+            }
+            self.verifyReveal(
+                processIdentifier: processIdentifier,
+                previous: previous,
+                target: target,
+                generation: generation,
+                retriesRemaining: retriesRemaining - 1,
+                delay: 0.6
+            )
+        }
+    }
+
+    private func requestVerifiedHide(
+        _ running: NSRunningApplication,
+        previous: pid_t?,
+        target: TargetApplication,
+        failureMessage: String,
+        successMessage: String
+    ) {
+        let generation = visibilityAttempt.begin()
+        _ = running.hide()
+        verifyHide(
+            processIdentifier: running.processIdentifier,
+            previous: previous,
+            target: target,
+            generation: generation,
+            retriesRemaining: 1,
+            delay: 0.2,
+            failureMessage: failureMessage,
+            successMessage: successMessage
+        )
+    }
+
+    private func verifyHide(
+        processIdentifier: pid_t,
+        previous: pid_t?,
+        target: TargetApplication,
+        generation: Int,
+        retriesRemaining: Int,
+        delay: TimeInterval,
+        failureMessage: String,
+        successMessage: String
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.visibilityAttempt.isLaunching,
+                  self.visibilityAttempt.generation == generation else { return }
+            let refreshed = self.verifiedRunningApplication(
+                processIdentifier,
+                matching: target.bundleIdentifier
+            )
+            if let refreshed, refreshed.isHidden {
+                guard self.visibilityAttempt.complete(generation) else { return }
+                self.activatePrevious(previous)
+                self.say(successMessage)
+                return
+            }
+            guard retriesRemaining > 0 else {
+                guard self.visibilityAttempt.complete(generation) else { return }
+                self.say(failureMessage, .error)
+                return
+            }
+            self.verifyHide(
+                processIdentifier: processIdentifier,
+                previous: previous,
+                target: target,
+                generation: generation,
+                retriesRemaining: retriesRemaining - 1,
+                delay: 0.6,
+                failureMessage: failureMessage,
+                successMessage: successMessage
+            )
+        }
+    }
+
+    private func verifiedRunningApplication(
+        _ processIdentifier: pid_t,
+        matching bundleIdentifier: String
+    ) -> NSRunningApplication? {
+        guard let refreshed = NSRunningApplication(processIdentifier: processIdentifier),
+              !refreshed.isTerminated,
+              refreshed.bundleIdentifier == bundleIdentifier else { return nil }
+        return refreshed
+    }
+
     private func reopenRunningApplication(
         _ running: NSRunningApplication,
         previous: pid_t?,
@@ -1723,11 +2382,10 @@ private final class ToggleEngine {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.createsNewApplicationInstance = false
-        beginLaunch()
+        let generation = beginLaunch()
         workspace.openApplication(at: resolvedURL, configuration: configuration) { [weak self] app, error in
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.isLaunching = false
+                guard let self, self.launchAttempt.complete(generation) else { return }
                 let reopened = app ?? running
                 guard error == nil,
                       reopened.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) else {
@@ -1775,12 +2433,13 @@ private final class ToggleEngine {
 
         switch decision {
         case .hideTarget:
-            guard current.hide() else {
-                say("系统暂时无法隐藏目标应用；没有关闭任何窗口。", .error)
-                return decision
-            }
-            activatePrevious(session.previousProcessIdentifier)
-            say("已恢复按键前状态；没有关闭任何窗口。")
+            requestVerifiedHide(
+                current,
+                previous: session.previousProcessIdentifier,
+                target: target,
+                failureMessage: "系统暂时无法隐藏目标应用；没有关闭任何窗口。",
+                successMessage: "已恢复按键前状态；没有关闭任何窗口。"
+            )
         case .minimizeExactWindow:
             guard case .minimized(let window) = session.state,
                   Accessibility.isTrusted,
@@ -1834,28 +2493,29 @@ private final class ToggleEngine {
         return true
     }
 
-    private func beginLaunch() {
-        isLaunching = true
-        launchGeneration += 1
-        let generation = launchGeneration
+    @discardableResult
+    private func beginLaunch() -> Int {
+        let generation = launchAttempt.begin()
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            guard let self, self.isLaunching, self.launchGeneration == generation else { return }
-            self.isLaunching = false
+            guard let self, self.launchAttempt.invalidate(generation) else { return }
             self.say("目标应用启动超时，可再试一次。", .error)
         }
+        return generation
     }
 }
 
 // MARK: - Application model
 
 private final class QuickToggleModel {
+    let previewMode: Bool
     var onChange: (() -> Void)?
     var onSettingsHotKey: (() -> Void)?
     private(set) var bindings: [AppBinding]
     private(set) var occupiedHotKeys: [OccupiedHotKeyEntry] = []
+    private(set) var shortcutConflictKnowledge: ShortcutConflictKnowledge = [:]
     private(set) var isEnabled: Bool
     private(set) var settingsShortcut: Shortcut
-    private(set) var statusMessage = "请添加应用并录制快捷键。"
+    private(set) var statusMessage = "添加应用后，轻唤会自动分配快捷键。"
     private(set) var statusTone: StatusTone = .info
     private var statusStickyUntil = Date.distantPast
     private var hotKeyRecoveryFailed = false
@@ -1870,18 +2530,38 @@ private final class QuickToggleModel {
         label: "3"
     )
 
-    init(diagnosticMode: Bool) {
+    init(diagnosticMode: Bool, previewMode: Bool = false, previewBindings: [AppBinding]? = nil) {
+        self.previewMode = previewMode
         if diagnosticMode {
             preferences = nil
             bindings = []
             isEnabled = false
             settingsShortcut = Self.defaultSettingsShortcut
             statusMessage = "诊断模式：未读取或写入用户设置。"
+            if previewMode, previewBindings == nil {
+                // Read an in-memory copy directly; the migration loader writes defaults.
+                let defaults = UserDefaults(suiteName: "com.quicktoggle.app")
+                if let data = defaults?.data(forKey: "quickToggle.bindings"),
+                   let saved = try? JSONDecoder().decode([AppBinding].self, from: data) {
+                    bindings = saved
+                }
+                if let data = defaults?.data(forKey: "quickToggle.occupiedHotKeys"),
+                   let saved = try? JSONDecoder().decode([OccupiedHotKeyEntry].self, from: data) {
+                    occupiedHotKeys = saved
+                }
+                if let data = defaults?.data(forKey: "quickToggle.settingsShortcut"),
+                   let saved = try? JSONDecoder().decode(Shortcut.self, from: data) {
+                    settingsShortcut = saved
+                }
+                statusMessage = "界面预览：使用当前配置的副本，修改仅保留在本次预览。"
+            }
+            if previewMode, let previewBindings { bindings = previewBindings }
         } else {
             let store = PreferenceStore()
             preferences = store
             bindings = store.loadBindings()
             occupiedHotKeys = store.loadOccupiedHotKeys()
+            shortcutConflictKnowledge = store.loadShortcutConflictKnowledge()
             isEnabled = store.enabled
             settingsShortcut = store.settingsShortcut ?? Self.defaultSettingsShortcut
             importVerifiedLaunchApps()
@@ -1904,6 +2584,8 @@ private final class QuickToggleModel {
             case .success: break
             case .failure(.occupied):
                 applyStatus("设置快捷键 \(settingsShortcut.displayName) 已被其他应用占用。", tone: .error)
+            case .failure(.permissionDenied):
+                applyStatus("设置快捷键 \(settingsShortcut.displayName) 需要辅助功能授权才能监听 fn/🌐。", tone: .error)
             case .failure(.failed):
                 applyStatus("系统无法注册设置快捷键 \(settingsShortcut.displayName)。", tone: .error)
             }
@@ -1911,10 +2593,31 @@ private final class QuickToggleModel {
     }
 
     var registeredShortcutCount: Int { hotKeys.values.filter(\.isActive).count }
+    func shortcutState(for binding: AppBinding) -> (text: String, color: NSColor) {
+        guard binding.shortcut != nil else { return ("待设置", .secondaryLabelColor) }
+        if previewMode { return ("预览", .secondaryLabelColor) }
+        guard isEnabled else { return ("已暂停", .secondaryLabelColor) }
+        return hotKeys[binding.id]?.isActive == true
+            ? ("已注册", .systemGreen)
+            : ("未注册 · 请检查组合", .systemOrange)
+    }
+    var diagnosticSummary: String {
+        let configured = bindings.filter { $0.shortcut != nil }.count
+        let configuredFunction = bindings.filter { $0.shortcut?.isFunctionDigit == true }.count
+            + (settingsShortcut.isFunctionDigit ? 1 : 0)
+        let registration = isEnabled
+            ? "应用热键 \(registeredShortcutCount)/\(configured) 已注册"
+            : "应用热键已全部停用"
+        let permission = Accessibility.isTrusted ? "辅助功能已授权" : "辅助功能未授权"
+        let functionChannel = FunctionHotKeyCenter.shared.diagnosticDescription(
+            configuredCount: configuredFunction
+        )
+        return "\(bindings.count) 个应用 · \(registration) · \(functionChannel) · \(permission)"
+    }
     var accessibilityStatus: String {
         Accessibility.isTrusted
-            ? "已授权：可以精确恢复最小化窗口。"
-            : "未授权：仍可激活/隐藏；最小化窗口会降级为隐藏恢复。"
+            ? "已授权，可恢复最小化窗口并使用 fn 快捷键。"
+            : "可选；普通快捷键无需授权。"
     }
 
     func addTarget(url: URL) -> Bool {
@@ -1944,11 +2647,18 @@ private final class QuickToggleModel {
             launchIfNeeded: true
         ))
         saveBindings()
-        if let suggested = nextFreeCommandDigit {
+        if let suggested = nextFreeRecommendedDigit {
             if applyShortcut(suggested, for: bindingID) {
-                reportStatus(
-                    "已为 \(displayName) 分配 \(suggested.displayName)：按一下呼出，再按一下藏回。点行内按钮可换键。"
-                )
+                if previewMode {
+                    reportStatus("预览：为 \(displayName) 分配 \(suggested.displayName)，本次预览关闭后不保留。")
+                    return true
+                }
+                let message = "已为 \(displayName) 分配 \(suggested.displayName)：按一下呼出，再按一下藏回。点行内按钮可换键。"
+                if let warning = shortcutWarning(for: suggested) {
+                    reportStatus(message + " " + warning, tone: .warning)
+                } else {
+                    reportStatus(message)
+                }
                 return true
             }
             return true
@@ -1957,8 +2667,8 @@ private final class QuickToggleModel {
         return true
     }
 
-    var nextFreeCommandDigit: Shortcut? {
-        ShortcutSuggester.nextFreeCommandDigit(
+    var nextFreeRecommendedDigit: Shortcut? {
+        ShortcutSuggester.nextFreeRecommendedDigit(
             bindings: bindings,
             occupied: occupiedHotKeys,
             settingsShortcut: settingsShortcut
@@ -1968,6 +2678,9 @@ private final class QuickToggleModel {
     func applyShortcut(_ candidate: Shortcut, for bindingID: UUID) -> Bool {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return false }
         let binding = bindings[index]
+        let preservedShortcut = binding.shortcut == nil
+            ? "请改用其他组合。"
+            : "原快捷键仍然有效。"
         switch ShortcutProbe.inspect(
             candidate,
             appName: binding.target.name,
@@ -1985,28 +2698,41 @@ private final class QuickToggleModel {
             reportStatus("已探测：找不到 \(name)。未改键。", tone: .error)
             return false
         case .usedByQuickToggle:
-            reportStatus("已探测：该组合已用于轻唤其他应用。原快捷键仍然有效。", tone: .warning)
+            reportStatus("已探测：该组合已用于轻唤其他应用。\(preservedShortcut)", tone: .warning)
             return false
         case .occupiedLocally(let owner):
-            reportStatus("已探测：占用（\(owner)）。未改键。", tone: .warning)
+            reportStatus("已探测：占用（\(owner)）。\(preservedShortcut)", tone: .warning)
             return false
         case .ready:
             break
         }
 
+        if previewMode {
+            bindings[index].shortcut = candidate
+            reportStatus("预览：\(binding.target.name) → \(candidate.displayName)，没有注册或保存到当前配置。")
+            return true
+        }
         let manager = hotKeyManager(for: bindingID)
         let result = isEnabled ? manager.replace(with: candidate) : manager.probe(candidate)
         switch result {
         case .failure(.occupied):
-            reportStatus("已探测：系统占用。原快捷键仍然有效。", tone: .warning)
+            reportStatus("已探测：系统占用。\(preservedShortcut)", tone: .warning)
+            return false
+        case .failure(.permissionDenied):
+            reportStatus("fn/🌐 热键需要“辅助功能”授权；完成授权后请重新录制。\(preservedShortcut)", tone: .error)
             return false
         case .failure(.failed):
-            reportStatus("已探测：系统无法注册该组合。原快捷键仍然有效。", tone: .error)
+            reportStatus(
+                candidate.isFunctionDigit
+                    ? "已探测：系统无法建立 fn/🌐 事件监听。\(preservedShortcut)"
+                    : "已探测：系统无法注册该组合。\(preservedShortcut)",
+                tone: .error
+            )
             return false
         case .success:
             bindings[index].shortcut = candidate
             saveBindings()
-            if let warning = candidate.riskWarning {
+            if let warning = shortcutWarning(for: candidate) {
                 reportStatus("已探测：空闲。\(warning)", tone: .warning)
             } else {
                 reportStatus(
@@ -2043,12 +2769,25 @@ private final class QuickToggleModel {
             break
         }
 
+        if previewMode {
+            settingsShortcut = candidate
+            reportStatus("预览：打开轻唤的快捷键改为 \(candidate.displayName)。")
+            return true
+        }
         switch settingsHotKey.replace(with: candidate) {
         case .failure(.occupied):
             reportStatus("已探测：系统占用。原设置快捷键仍然有效。", tone: .warning)
             return false
+        case .failure(.permissionDenied):
+            reportStatus("fn/🌐 热键需要“辅助功能”授权；系统已提示授权，完成后请重新录制。原设置快捷键仍然有效。", tone: .error)
+            return false
         case .failure(.failed):
-            reportStatus("已探测：系统无法注册该组合。原设置快捷键仍然有效。", tone: .error)
+            reportStatus(
+                candidate.isFunctionDigit
+                    ? "已探测：系统无法建立 fn/🌐 事件监听。原设置快捷键仍然有效。"
+                    : "已探测：系统无法注册该组合。原设置快捷键仍然有效。",
+                tone: .error
+            )
             return false
         case .success:
             settingsShortcut = candidate
@@ -2074,6 +2813,15 @@ private final class QuickToggleModel {
         return true
     }
 
+    func conflictWarning(for shortcut: Shortcut) -> String? {
+        ShortcutConflictKnowledgeBase.warning(for: shortcut, in: shortcutConflictKnowledge)
+    }
+
+    private func shortcutWarning(for shortcut: Shortcut) -> String? {
+        let warnings = [shortcut.riskWarning, conflictWarning(for: shortcut)].compactMap { $0 }
+        return warnings.isEmpty ? nil : warnings.joined(separator: " ")
+    }
+
     func toggleLaunchIfNeeded(for bindingID: UUID) {
         guard let index = bindings.firstIndex(where: { $0.id == bindingID }) else { return }
         bindings[index].launchIfNeeded.toggle()
@@ -2096,6 +2844,11 @@ private final class QuickToggleModel {
     }
 
     func toggleEnabled() {
+        if previewMode {
+            isEnabled.toggle()
+            reportStatus("预览：\(isEnabled ? "启用" : "暂停")界面状态，实际快捷键保持不变。")
+            return
+        }
         if isEnabled {
             for manager in hotKeys.values where manager.isActive {
                 guard case .success = manager.disable() else {
@@ -2124,8 +2877,9 @@ private final class QuickToggleModel {
     }
 
     func requestAccessibility() {
-        Accessibility.request()
-        reportStatus("已请求辅助功能权限；授权后返回轻唤即可刷新状态。")
+        guard !previewMode else { return }
+        Accessibility.requestExplicitly()
+        reportStatus("已请求辅助功能权限；授权后可精确恢复窗口并使用 fn/🌐 热键，返回轻唤即可刷新状态。")
     }
 
     var loginAtLaunchEnabled: Bool { LoginAtLaunch.status.isOn }
@@ -2133,6 +2887,7 @@ private final class QuickToggleModel {
     var loginAtLaunchHelp: String { LoginAtLaunch.status.helpText }
 
     func setLoginAtLaunch(_ enabled: Bool) {
+        guard !previewMode else { return }
         let (status, error) = LoginAtLaunch.setEnabled(enabled)
         if let error {
             reportStatus(error, tone: .warning)
@@ -2155,6 +2910,7 @@ private final class QuickToggleModel {
         var imported = Set(preferences.importedVerifiedLaunchIDs)
         var added: [String] = []
         var occupied: [String] = []
+        var conflictWarnings: [String] = []
         for item in VerifiedLaunchHotKeys.all {
             let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: item.bundleIdentifier)
             guard let url, FileManager.default.fileExists(atPath: url.path) else { continue }
@@ -2171,17 +2927,21 @@ private final class QuickToggleModel {
             }
             if !applyShortcut(item.shortcut, for: bindingID) {
                 occupied.append("\(item.name) \(item.shortcut.displayName)")
+            } else if let warning = conflictWarning(for: item.shortcut) {
+                conflictWarnings.append(warning)
             }
         }
         preferences.importedVerifiedLaunchIDs = Array(imported).sorted()
         if added.isEmpty { return }
-        if occupied.isEmpty {
+        if occupied.isEmpty && conflictWarnings.isEmpty {
             applyStatus("已加入 \(added.joined(separator: "、"))，可在本行直接修改快捷键。", tone: .info)
         } else {
-            applyStatus(
-                "已加入 \(added.joined(separator: "、"))。\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。",
-                tone: .warning
-            )
+            var details: [String] = []
+            if !occupied.isEmpty {
+                details.append("\(occupied.joined(separator: "、")) 正被应用自己占用，点右侧改成其他组合后立即由轻唤接管。")
+            }
+            details.append(contentsOf: conflictWarnings)
+            applyStatus("已加入 \(added.joined(separator: "、"))。" + details.joined(separator: " "), tone: .warning)
         }
     }
 
@@ -2190,6 +2950,7 @@ private final class QuickToggleModel {
         var imported = Set(preferences.importedSuggestedAppIDs)
         var added: [String] = []
         var occupied: [String] = []
+        var conflictWarnings: [String] = []
         for item in SuggestedToggleApps.all {
             let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: item.bundleIdentifier)
             guard let url, FileManager.default.fileExists(atPath: url.path) else { continue }
@@ -2206,17 +2967,21 @@ private final class QuickToggleModel {
             }
             if !applyShortcut(item.shortcut, for: bindingID) {
                 occupied.append("\(item.name) \(item.shortcut.displayName)")
+            } else if let warning = conflictWarning(for: item.shortcut) {
+                conflictWarnings.append(warning)
             }
         }
         preferences.importedSuggestedAppIDs = Array(imported).sorted()
         if added.isEmpty { return }
-        if occupied.isEmpty {
+        if occupied.isEmpty && conflictWarnings.isEmpty {
             applyStatus("已加入 \(added.joined(separator: "、"))，保存并立即生效。", tone: .info)
         } else {
-            applyStatus(
-                "已加入应用，但 \(occupied.joined(separator: "、")) 被占用，请在本行改成其他组合。",
-                tone: .warning
-            )
+            var details: [String] = []
+            if !occupied.isEmpty {
+                details.append("\(occupied.joined(separator: "、")) 被占用，请在本行改成其他组合。")
+            }
+            details.append(contentsOf: conflictWarnings)
+            applyStatus("已加入应用。" + details.joined(separator: " "), tone: .warning)
         }
     }
 
@@ -2327,7 +3092,8 @@ private final class QuickToggleModel {
     }
 
     func reportStatus(_ message: String, tone: StatusTone = .info) {
-        applyStatus(message, tone: tone, preserveStickyFailure: false)
+        let displayed = previewMode && !message.hasPrefix("预览") ? "预览：" + message : message
+        applyStatus(displayed, tone: tone, preserveStickyFailure: false)
         onChange?()
     }
 
@@ -2400,8 +3166,12 @@ private final class QuickToggleModel {
         return (active, failed)
     }
 
-    private func handleHotKey(_ bindingID: UUID) {
+    fileprivate func handleHotKey(_ bindingID: UUID) {
         guard let binding = bindings.first(where: { $0.id == bindingID }) else { return }
+        guard !previewMode else {
+            reportStatus("预览：已点选 \(binding.target.name)。实际呼出与恢复在正式候选中验证。")
+            return
+        }
         toggleEngine(for: bindingID).toggle(
             binding.target,
             launchIfNeeded: binding.launchIfNeeded
@@ -2419,6 +3189,7 @@ private final class ShortcutRecorderButton: NSButton {
 
     private var isRecording = false
     private var monitor: Any?
+    private var resignKeyObserver: NSObjectProtocol?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2427,8 +3198,8 @@ private final class ShortcutRecorderButton: NSButton {
         setButtonType(.momentaryPushIn)
         controlSize = .large
         font = .monospacedSystemFont(ofSize: 14, weight: .semibold)
-        bezelColor = .systemOrange
-        contentTintColor = .white
+        bezelColor = nil
+        contentTintColor = nil
         target = self
         action = #selector(beginRecording)
         focusRingType = .default
@@ -2449,6 +3220,13 @@ private final class ShortcutRecorderButton: NSButton {
         isRecording = true
         title = "请按组合键…"
         removeMonitor()
+        resignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.finish()
+        }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, Self.shouldCapture(
                 isRecording: self.isRecording,
@@ -2457,6 +3235,7 @@ private final class ShortcutRecorderButton: NSButton {
             self.handle(event)
             return nil
         }
+        updateAccessibilityState()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -2499,30 +3278,41 @@ private final class ShortcutRecorderButton: NSButton {
         isRecording = false
         removeMonitor()
         updateTitle()
+        updateAccessibilityState()
     }
 
     private func removeMonitor() {
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
+        resignKeyObserver = nil
     }
 
     private func updateTitle() {
         title = isRecording ? "请按组合键…" : shortcut?.displayName ?? "未设置"
         setAccessibilityValue(title)
     }
+
+    private func updateAccessibilityState() {
+        if isRecording {
+            setAccessibilityValue("正在录制，请按组合键")
+            setAccessibilityHelp("输入组合键；Esc 取消，Delete 或 Backspace 清除。切换到其他窗口会自动取消。")
+        } else {
+            setAccessibilityValue(shortcut?.displayName ?? "未设置")
+            setAccessibilityHelp("按下按钮后输入组合键；Esc 取消，Delete 或 Backspace 清除。")
+        }
+    }
 }
 
 // MARK: - Native single-page settings
 
-private final class GlassCardView: NSVisualEffectView {
+private final class GlassCardView: NSBox {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        material = .hudWindow
-        blendingMode = .withinWindow
-        state = .active
-        wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.masksToBounds = true
+        boxType = .custom
+        titlePosition = .noTitle
+        cornerRadius = 10
+        borderWidth = 1
         updateColors()
     }
 
@@ -2536,42 +3326,10 @@ private final class GlassCardView: NSVisualEffectView {
     private func updateColors() {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        let fill: NSColor
-        if reduced {
-            fill = dark ? NSColor(calibratedWhite: 0.14, alpha: 1) : NSColor(calibratedWhite: 0.96, alpha: 1)
-        } else {
-            fill = dark ? NSColor(calibratedWhite: 0.17, alpha: 0.62) : NSColor.white.withAlphaComponent(0.55)
-        }
-        layer?.backgroundColor = fill.cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = (dark
-            ? NSColor.white.withAlphaComponent(0.13)
-            : NSColor.black.withAlphaComponent(0.10)).cgColor
-    }
-}
-
-private enum ColorTheme: String {
-    case aurora
-    case ember
-
-    var primary: NSColor { self == .aurora ? .systemBlue : .systemOrange }
-    var recorder: NSColor { self == .aurora ? .systemPurple : .systemOrange }
-}
-
-private final class AccentRailView: NSView {
-    var theme = ColorTheme.aurora { didSet { needsDisplay = true } }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let path = NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2)
-        NSColor.separatorColor.withAlphaComponent(0.30).setFill()
-        path.fill()
-        if theme == .aurora {
-            NSGradient(colors: [.systemPurple, .systemBlue])?.draw(in: path, angle: 0)
-        } else {
-            NSColor.systemOrange.setFill()
-            path.fill()
-        }
+        fillColor = reduced
+            ? .windowBackgroundColor
+            : .controlBackgroundColor.withAlphaComponent(dark ? 0.58 : 0.76)
+        borderColor = .separatorColor.withAlphaComponent(dark ? 0.55 : 0.38)
     }
 }
 
@@ -2585,36 +3343,171 @@ private final class StatusDotView: NSView {
     }
 }
 
+private final class BindingActionRow: NSBox {
+    var onPress: (() -> Void)?
+    private var tracking: NSTrackingArea?
+    private var hovered = false
+    private var keyboardFocused = false
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true; updateRowColors() }
+    override func mouseExited(with event: NSEvent) { hovered = false; updateRowColors() }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateRowColors()
+    }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { keyboardFocused = true }
+        updateRowColors()
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted { keyboardFocused = false }
+        updateRowColors()
+        return accepted
+    }
+    private func updateRowColors() {
+        borderColor = keyboardFocused ? .controlAccentColor : .clear
+        fillColor = hovered ? .controlAccentColor.withAlphaComponent(0.06) : .clear
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.separatorColor.withAlphaComponent(0.35).setStroke()
+        let line = NSBezierPath()
+        line.move(to: NSPoint(x: 54, y: 0.5))
+        line.line(to: NSPoint(x: max(54, bounds.width - 10), y: 0.5))
+        line.lineWidth = 0.5
+        line.stroke()
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        var ancestor: NSView? = hit
+        while let view = ancestor, view !== self {
+            // Embedded controls keep their own click and recording behavior.
+            if view is NSButton { return hit }
+            if let text = view as? NSTextField, text.isEditable || text.isSelectable { return hit }
+            ancestor = view.superview
+        }
+        return self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard event.type == .leftMouseDown else { return }
+        window?.makeFirstResponder(self)
+        onPress?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers.isEmpty && [UInt16(kVK_Space), UInt16(kVK_Return)].contains(event.keyCode) {
+            if !event.isARepeat { onPress?() }
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard let onPress else { return false }
+        onPress()
+        return true
+    }
+}
+
 private final class FlippedStackView: NSStackView {
     override var isFlipped: Bool { true }
 }
 
-private final class SettingsController: NSObject {
-    let window: NSWindow
+private enum ApplicationListScope: Int {
+    case all, needsShortcut, occupied
+}
+
+private enum ApplicationListFilter {
+    static func rows(bindings: [AppBinding], occupied: [OccupiedHotKeyEntry], scope: ApplicationListScope, query: String) -> [QuickToggleRow] {
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let rows: [QuickToggleRow]
+        switch scope {
+        case .all: rows = bindings.map(QuickToggleRow.binding)
+        case .needsShortcut: rows = bindings.filter { $0.shortcut == nil }.map(QuickToggleRow.binding)
+        case .occupied: rows = occupied.map(QuickToggleRow.occupied)
+        }
+        return BindingOrder.sorted(rows).filter { row in
+            let searchable: String
+            switch row {
+            case .binding(let binding):
+                searchable = [binding.target.name, binding.shortcut?.displayName ?? "未设置"].joined(separator: " ")
+            case .occupied(let entry):
+                searchable = entry.name + " " + entry.shortcut.displayName
+            }
+            return terms.allSatisfy { searchable.localizedCaseInsensitiveContains($0) }
+        }
+    }
+}
+
+private final class QuickToggleWindow: NSWindow {
+    var onFind: (() -> Void)?
+    var onAdd: (() -> Void)?
+    var onPreferences: (() -> Void)?
+
+    override func cancelOperation(_ sender: Any?) {
+        if sheetParent != nil { performClose(sender) } else { super.cancelOperation(sender) }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch Int(event.keyCode) {
+        case kVK_ANSI_F where onFind != nil: onFind?(); return true
+        case kVK_ANSI_N where onAdd != nil: onAdd?(); return true
+        case kVK_ANSI_Comma where onPreferences != nil: onPreferences?(); return true
+        case kVK_ANSI_W: performClose(nil); return true
+        default: return super.performKeyEquivalent(with: event)
+        }
+    }
+}
+
+private final class SettingsController: NSObject, NSSearchFieldDelegate, NSWindowDelegate {
+    let window: QuickToggleWindow
     private let model: QuickToggleModel
     private let bindingsStack = FlippedStackView()
     private let listScroll = NSScrollView()
     private let countLabel = NSTextField(labelWithString: "")
     private let permissionStatus = NSTextField(wrappingLabelWithString: "")
     private let generalStatus = NSTextField(wrappingLabelWithString: "")
+    private let preferencesStatus = NSTextField(wrappingLabelWithString: "")
     private let addButton = NSButton()
     private let enableButton = NSButton()
     private let permissionButton = NSButton()
     private let permissionIcon = NSImageView()
     private let loginButton = NSButton()
     private let settingsShortcutRecorder = ShortcutRecorderButton(frame: .zero)
-    private let themeControl = NSSegmentedControl()
     private let guideButton = NSButton()
     private let guideCard = GlassCardView(frame: .zero)
     private let appGuideButton = NSButton()
     private let appGuideCard = GlassCardView(frame: .zero)
     private let statusDot = StatusDotView(frame: .zero)
-    private let accentRail = AccentRailView(frame: .zero)
-    private var guideAccentIcons: [NSImageView] = []
+    private let statusBanner = NSView()
+    private let searchField = NSSearchField()
+    private let scopeControl = NSSegmentedControl()
+    private let listTitle = NSTextField(labelWithString: "我的应用")
+    private let preferencesButton = NSButton()
+    private var preferencesPanel: QuickToggleWindow?
+    private var rowStatusLabels: [UUID: NSTextField] = [:]
     private var lastRenderedBindings: [AppBinding]?
     private var guideExpanded = false
     private var appGuideExpanded = false
-    private var colorTheme = ColorTheme.aurora
     private let helpPopover = NSPopover()
     private let addPopover = NSPopover()
     private let pendingPicker = PendingApplicationPickerController()
@@ -2625,23 +3518,23 @@ private final class SettingsController: NSObject {
     init(model: QuickToggleModel) {
         self.model = model
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let height = min(640, max(500, visible.height - 48))
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: height),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+        let height = min(690, max(500, visible.height - 48))
+        window = QuickToggleWindow(
+            contentRect: NSRect(x: 0, y: 0, width: min(760, visible.width - 48), height: height),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         super.init()
-        colorTheme = ColorTheme(
-            rawValue: UserDefaults.standard.string(forKey: "quickToggle.colorTheme") ?? ""
-        ) ?? .aurora
-        window.title = "轻唤 · QuickToggle"
+        window.title = model.previewMode ? "轻唤 · \(appVersion) 预览" : "轻唤 · QuickToggle"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 600, height: 500)
-        window.maxSize = NSSize(width: 720, height: max(visible.height - 24, 560))
+        window.delegate = self
+        window.onFind = { [weak self] in self?.focusSearch() }
+        window.onAdd = { [weak self] in self?.chooseApplication() }
+        window.onPreferences = { [weak self] in self?.showPreferences() }
         window.isReleasedWhenClosed = false
         applyAccessibilityChrome()
         window.center()
@@ -2664,20 +3557,32 @@ private final class SettingsController: NSObject {
             rebuildBindingRows()
         }
 
-        countLabel.stringValue = "\(model.bindings.count) 个应用"
         permissionStatus.stringValue = model.accessibilityStatus
         generalStatus.stringValue = model.statusMessage
+        generalStatus.toolTip = model.statusMessage
+        preferencesStatus.stringValue = model.statusMessage
+        preferencesStatus.textColor = model.statusTone.color
         generalStatus.textColor = model.statusTone.color
         loginButton.state = model.loginAtLaunchEnabled ? .on : .off
         loginButton.toolTip = model.loginAtLaunchHelp
         settingsShortcutRecorder.shortcut = model.settingsShortcut
-        enableButton.title = model.isEnabled ? "全部已启用" : "启用全部"
-        enableButton.bezelColor = model.isEnabled ? colorTheme.primary : nil
-        enableButton.contentTintColor = model.isEnabled ? .white : nil
-        statusDot.color = model.registeredShortcutCount > 0 ? .systemGreen : .systemOrange
-        accentRail.alphaValue = model.isEnabled ? 1 : 0.38
-        permissionButton.title = Accessibility.isTrusted ? "已授权" : "开启精确恢复…"
-        permissionButton.isEnabled = !Accessibility.isTrusted
+        enableButton.state = model.isEnabled ? .on : .off
+        statusDot.color = model.statusTone == .info
+            ? (model.registeredShortcutCount > 0 ? .systemGreen : .secondaryLabelColor)
+            : model.statusTone.color
+        rowStatusLabels.forEach { id, label in
+            guard let binding = model.bindings.first(where: { $0.id == id }) else { return }
+            let state = model.shortcutState(for: binding)
+            label.stringValue = state.text
+            label.textColor = state.color
+        }
+        statusBanner.layer?.backgroundColor = model.statusTone == .info
+            ? NSColor.clear.cgColor
+            : model.statusTone.color.withAlphaComponent(0.14).cgColor
+        permissionIcon.contentTintColor = Accessibility.isTrusted ? .systemGreen : .secondaryLabelColor
+        permissionButton.isHidden = Accessibility.isTrusted
+        permissionButton.isEnabled = !model.previewMode
+        loginButton.isEnabled = !model.previewMode
     }
 
     private func buildInterface() {
@@ -2689,14 +3594,13 @@ private final class SettingsController: NSObject {
         window.contentView = material
 
         let title = NSTextField(labelWithString: "轻唤")
-        title.font = .systemFont(ofSize: 27, weight: .bold)
-        let productIdentity = NSTextField(labelWithString: "QuickToggle")
+        title.font = .systemFont(ofSize: 23, weight: .bold)
+        let productIdentity = NSTextField(labelWithString: model.previewMode ? "\(appVersion) 预览" : "QuickToggle")
         productIdentity.textColor = .secondaryLabelColor
         productIdentity.font = .systemFont(ofSize: 11.5, weight: .medium)
         settingsShortcutRecorder.shortcut = model.settingsShortcut
         settingsShortcutRecorder.controlSize = .small
         settingsShortcutRecorder.font = .monospacedSystemFont(ofSize: 11.5, weight: .semibold)
-        settingsShortcutRecorder.bezelColor = colorTheme.recorder
         settingsShortcutRecorder.onRecord = { [weak self] shortcut in
             self?.model.applySettingsShortcut(shortcut) == true
         }
@@ -2710,38 +3614,40 @@ private final class SettingsController: NSObject {
         settingsShortcutRecorder.widthAnchor.constraint(equalToConstant: 72).isActive = true
         settingsShortcutRecorder.heightAnchor.constraint(equalToConstant: 26).isActive = true
         settingsShortcutRecorder.setAccessibilityLabel("轻唤设置窗口快捷键")
-        settingsShortcutRecorder.setAccessibilityHelp("点击后录制新的显示或隐藏设置窗口快捷键；推荐 Command 加任意数字，Esc 取消。")
-        settingsShortcutRecorder.toolTip = "点击更换；推荐 ⌘0–9，也可用 ⌘⌥K / ⌘⇧K"
-        let titleRow = horizontalStack([title, productIdentity, settingsShortcutRecorder], spacing: 9)
+        settingsShortcutRecorder.setAccessibilityHelp("点击后录制新的显示或隐藏设置窗口快捷键；推荐 Command 加数字，或 fn/Globe 加数字，Esc 取消。")
+        settingsShortcutRecorder.toolTip = "点击更换；优先推荐 ⌘0–9，也可用 fn/🌐0–9、⌘⌥K / ⌘⇧K"
+        let titleRow = horizontalStack([title, productIdentity], spacing: 9)
         titleRow.alignment = .lastBaseline
-        let subtitle = NSTextField(labelWithString: "每个应用一组快捷键。按一下呼出，再按一次安全恢复。")
+        let subtitle = NSTextField(labelWithString: "一按呼出，再按恢复。")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = .systemFont(ofSize: 12.5)
         let titleStack = verticalStack([titleRow, subtitle], spacing: 3)
         let headerSpacer = NSView()
         headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        let settingsShortcutLabel = NSTextField(labelWithString: "打开轻唤")
+        settingsShortcutLabel.font = .systemFont(ofSize: 11.5)
+        settingsShortcutLabel.textColor = .secondaryLabelColor
+        let settingsShortcutControl = horizontalStack(
+            [settingsShortcutLabel, settingsShortcutRecorder],
+            spacing: 6
+        )
+        settingsShortcutControl.alignment = .centerY
+
         enableButton.target = self
         enableButton.action = #selector(toggleEnabled)
-        enableButton.bezelStyle = .rounded
-        enableButton.controlSize = .large
-        enableButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        enableButton.setButtonType(.switch)
+        enableButton.title = "启用快捷键"
+        enableButton.controlSize = .small
+        enableButton.font = .systemFont(ofSize: 12)
         enableButton.setAccessibilityLabel("启用或停用全部应用快捷键")
-        enableButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        enableButton.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        enableButton.widthAnchor.constraint(equalToConstant: 108).isActive = true
+        enableButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        themeControl.segmentCount = 2
-        themeControl.setLabel("极光", forSegment: 0)
-        themeControl.setLabel("火焰", forSegment: 1)
-        themeControl.selectedSegment = colorTheme == .aurora ? 0 : 1
-        themeControl.target = self
-        themeControl.action = #selector(selectTheme)
-        themeControl.controlSize = .small
-        themeControl.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        themeControl.heightAnchor.constraint(equalToConstant: 28).isActive = true
-        themeControl.setAccessibilityLabel("配色主题")
-
-        let header = horizontalStack([titleStack, headerSpacer, themeControl, enableButton], spacing: 12)
+        let header = horizontalStack(
+            [titleStack, headerSpacer, settingsShortcutControl, enableButton],
+            spacing: 12
+        )
         header.alignment = .centerY
 
         let applicationsCard = GlassCardView(frame: .zero)
@@ -2749,7 +3655,6 @@ private final class SettingsController: NSObject {
         applicationsCard.setContentHuggingPriority(.defaultLow, for: .vertical)
         applicationsCard.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
-        let listTitle = NSTextField(labelWithString: "应用快捷键")
         listTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         countLabel.font = .systemFont(ofSize: 12)
         countLabel.textColor = .secondaryLabelColor
@@ -2760,29 +3665,57 @@ private final class SettingsController: NSObject {
         addButton.target = self
         addButton.action = #selector(chooseApplication)
         addButton.bezelStyle = .rounded
-        addButton.controlSize = .large
-        addButton.font = .systemFont(ofSize: 13, weight: .semibold)
-        addButton.bezelColor = colorTheme.primary
-        addButton.contentTintColor = .white
+        addButton.controlSize = .regular
+        addButton.font = .systemFont(ofSize: 12.5, weight: .medium)
+        addButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+        addButton.imagePosition = .imageLeading
         addButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        addButton.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        addButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
         addButton.setAccessibilityLabel("添加目标应用")
-        addButton.setAccessibilityHelp("打开已安装可视应用列表；也可从磁盘选择。添加后不会自动设置快捷键。")
+        addButton.setAccessibilityHelp("打开已安装应用列表；添加后自动分配一个可用的数字快捷键。")
         let listHeader = horizontalStack([listTitle, countLabel, listHeaderSpacer, addButton], spacing: 8)
         listHeader.alignment = .centerY
 
-        accentRail.heightAnchor.constraint(equalToConstant: 5).isActive = true
+        searchField.placeholderString = "搜索应用或快捷键"
+        searchField.font = .systemFont(ofSize: 12.5)
+        searchField.delegate = self
+        searchField.sendsSearchStringImmediately = true
+        searchField.setAccessibilityLabel("搜索应用或快捷键")
+        searchField.toolTip = "按 ⌘F 搜索应用名称或快捷键"
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 170).isActive = true
+        scopeControl.segmentCount = 3
+        for (index, label) in ["全部应用", "待设置", "占用记录"].enumerated() {
+            scopeControl.setLabel(label, forSegment: index)
+            scopeControl.setWidth(index == 1 ? 62 : 78, forSegment: index)
+        }
+        scopeControl.trackingMode = .selectOne
+        scopeControl.selectedSegment = 0
+        scopeControl.segmentStyle = .rounded
+        scopeControl.controlSize = .small
+        scopeControl.target = self
+        scopeControl.action = #selector(changeScope)
+        scopeControl.setAccessibilityLabel("列表范围")
+        let filterRow = horizontalStack([searchField, scopeControl], spacing: 12)
+        filterRow.alignment = .centerY
 
         bindingsStack.orientation = .vertical
         bindingsStack.alignment = .leading
         bindingsStack.distribution = .fill
-        bindingsStack.spacing = 6
+        bindingsStack.spacing = 5
         bindingsStack.edgeInsets = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
         listScroll.documentView = bindingsStack
         listScroll.hasVerticalScroller = true
         listScroll.autohidesScrollers = true
         listScroll.borderType = .noBorder
         listScroll.drawsBackground = false
+        bindingsStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            bindingsStack.leadingAnchor.constraint(equalTo: listScroll.contentView.leadingAnchor),
+            bindingsStack.topAnchor.constraint(equalTo: listScroll.contentView.topAnchor),
+            bindingsStack.widthAnchor.constraint(equalTo: listScroll.contentView.widthAnchor),
+            bindingsStack.heightAnchor.constraint(greaterThanOrEqualTo: listScroll.contentView.heightAnchor)
+        ])
         listScroll.setContentHuggingPriority(.init(1), for: .vertical)
         listScroll.setContentCompressionResistancePriority(.init(1), for: .vertical)
         listScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 168).isActive = true
@@ -2791,15 +3724,19 @@ private final class SettingsController: NSObject {
         statusDot.heightAnchor.constraint(equalToConstant: 10).isActive = true
         generalStatus.textColor = .secondaryLabelColor
         generalStatus.font = .systemFont(ofSize: 12.2, weight: .medium)
-        generalStatus.lineBreakMode = .byTruncatingTail
+        generalStatus.lineBreakMode = .byWordWrapping
+        generalStatus.maximumNumberOfLines = 3
         generalStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         generalStatus.setAccessibilityLabel("当前状态")
         let statusRow = horizontalStack([statusDot, generalStatus], spacing: 8)
         statusRow.alignment = .centerY
+        statusBanner.wantsLayer = true
+        statusBanner.layer?.cornerRadius = 8
+        pin(statusRow, inside: statusBanner, insets: NSEdgeInsets(top: 5, left: 9, bottom: 5, right: 9))
 
-        let applicationsStack = verticalStack([listHeader, accentRail, listScroll, statusRow], spacing: 8)
+        let applicationsStack = verticalStack([listHeader, filterRow, listScroll], spacing: 12)
         pin(applicationsStack, inside: applicationsCard, insets: NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14))
-        [listHeader, accentRail, listScroll, statusRow].forEach {
+        [listHeader, filterRow, listScroll].forEach {
             $0.widthAnchor.constraint(equalTo: applicationsStack.widthAnchor).isActive = true
         }
 
@@ -2807,7 +3744,7 @@ private final class SettingsController: NSObject {
             systemSymbolName: "lock.shield",
             accessibilityDescription: "窗口恢复能力"
         )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .medium))
-        permissionIcon.contentTintColor = colorTheme.primary
+        permissionIcon.contentTintColor = .secondaryLabelColor
         permissionIcon.widthAnchor.constraint(equalToConstant: 20).isActive = true
         permissionIcon.heightAnchor.constraint(equalToConstant: 20).isActive = true
 
@@ -2818,24 +3755,28 @@ private final class SettingsController: NSObject {
         let permissionSpacer = NSView()
         permissionSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        permissionButton.title = "开启精确恢复…"
+        permissionButton.title = "授权…"
         permissionButton.target = self
         permissionButton.action = #selector(requestAccessibility)
         permissionButton.bezelStyle = .rounded
         permissionButton.controlSize = .small
-        permissionButton.widthAnchor.constraint(equalToConstant: 118).isActive = true
+        permissionButton.font = .systemFont(ofSize: 12, weight: .medium)
         permissionButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        permissionButton.setAccessibilityHelp("只在点击后请求系统辅助功能权限。")
+        permissionButton.setAccessibilityHelp("授权后可恢复最小化窗口，并使用 fn/Globe 快捷键。")
+        let permissionTitle = NSTextField(labelWithString: "辅助功能")
+        permissionTitle.font = .systemFont(ofSize: 12.5, weight: .medium)
+        let permissionText = verticalStack([permissionTitle, permissionStatus], spacing: 1)
+
         let permissionRow = horizontalStack(
-            [permissionIcon, permissionStatus, permissionSpacer, permissionButton],
+            [permissionIcon, permissionText, permissionSpacer, permissionButton],
             spacing: 8
         )
         permissionRow.alignment = .centerY
-        permissionRow.setAccessibilityLabel("辅助功能权限")
+        permissionRow.setAccessibilityLabel("辅助功能")
         permissionRow.setContentHuggingPriority(.required, for: .vertical)
 
         loginButton.setButtonType(.switch)
-        loginButton.title = "登录时启动"
+        loginButton.title = "登录时自动启动"
         loginButton.target = self
         loginButton.action = #selector(toggleLoginAtLaunch)
         loginButton.font = .systemFont(ofSize: 12)
@@ -2846,7 +3787,21 @@ private final class SettingsController: NSObject {
         loginButton.setAccessibilityHelp("默认关闭。打开后由 macOS 在登录时启动轻唤，不会新增后台进程。")
         loginButton.setContentHuggingPriority(.required, for: .vertical)
 
-        guideButton.title = "macOS 原生快捷键"
+        let runtimeTitle = NSTextField(labelWithString: "运行")
+        runtimeTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        let runtimeSpacer = NSView()
+        runtimeSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let runtimeHeader = horizontalStack([runtimeTitle, runtimeSpacer, loginButton], spacing: 8)
+        runtimeHeader.alignment = .centerY
+        let runtimeStack = verticalStack([runtimeHeader, permissionRow], spacing: 10)
+        let runtimeCard = GlassCardView(frame: .zero)
+        runtimeCard.setAccessibilityLabel("运行设置")
+        pin(runtimeStack, inside: runtimeCard, insets: NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14))
+        [runtimeHeader, permissionRow].forEach {
+            $0.widthAnchor.constraint(equalTo: runtimeStack.widthAnchor).isActive = true
+        }
+
+        guideButton.title = "macOS 快捷键参考"
         guideButton.target = self
         guideButton.action = #selector(toggleGuide)
         guideButton.bezelStyle = .inline
@@ -2879,21 +3834,21 @@ private final class SettingsController: NSObject {
         nativeNote.maximumNumberOfLines = 2
 
         let customGuide = NSTextField(wrappingLabelWithString:
-            "优先推荐未占用的 ⌘0–9。其他可用：⌘⌥K、⌘⇧K、⌃⇧K、⌘⌥←/→、⌃⇧F1–F12。字母、方向键或 F 键至少两个修饰键，并包含 Command 或 Control。系统保留和高风险组合仍会阻止或警告。"
+            "优先推荐未占用的 ⌘0–9；⌘ 数字用尽后推荐 fn/🌐0–9（需辅助功能授权）。单按 Globe 的系统动作会警告；fn/🌐+F1–F12 受“将 F1、F2 等键用作标准功能键”影响，本版不注册。macOS 无法检测所有系统、应用或键盘固件冲突。"
         )
         customGuide.font = .systemFont(ofSize: 11.5)
         customGuide.textColor = .tertiaryLabelColor
-        customGuide.maximumNumberOfLines = 2
+        customGuide.maximumNumberOfLines = 3
 
         let guideContent = verticalStack([shortcutGrid, nativeNote, customGuide], spacing: 10)
         [shortcutGrid, nativeNote, customGuide].forEach {
             $0.widthAnchor.constraint(equalTo: guideContent.widthAnchor).isActive = true
         }
-        guideCard.heightAnchor.constraint(equalToConstant: 168).isActive = true
+        guideCard.heightAnchor.constraint(greaterThanOrEqualToConstant: 186).isActive = true
         guideCard.setAccessibilityLabel("macOS 原生快捷键指南")
         pin(guideContent, inside: guideCard, insets: NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18))
 
-        appGuideButton.title = "应用内快捷键"
+        appGuideButton.title = "应用快捷键与占用"
         appGuideButton.target = self
         appGuideButton.action = #selector(toggleAppGuide)
         appGuideButton.bezelStyle = .inline
@@ -2922,7 +3877,7 @@ private final class SettingsController: NSObject {
             applicationList = verticalStack(applicationRows, spacing: 8)
         }
 
-        let occupiedTitle = NSTextField(labelWithString: "添加本机占用记录（占用项按序显示在上方列表中）")
+        let occupiedTitle = NSTextField(labelWithString: "本机占用的快捷键（用于自动避开冲突）")
         occupiedTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
         occupiedTitle.textColor = .secondaryLabelColor
 
@@ -2935,7 +3890,6 @@ private final class SettingsController: NSObject {
 
         occupiedRecorder.controlSize = .small
         occupiedRecorder.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
-        occupiedRecorder.bezelColor = colorTheme.recorder
         occupiedRecorder.onRecord = { _ in true }
         occupiedRecorder.onClear = { true }
         occupiedRecorder.onInvalid = { [weak self] message in
@@ -2961,7 +3915,7 @@ private final class SettingsController: NSObject {
         )
 
         let applicationNote = NSTextField(wrappingLabelWithString:
-            "只收录本机核实过的项，避免和轻唤热键撞车。未列出的请看应用菜单，不要猜测。"
+            "这里只记录你确认过的占用项；其他快捷键请以应用菜单为准。"
         )
         applicationNote.font = .systemFont(ofSize: 11.5)
         applicationNote.textColor = .secondaryLabelColor
@@ -2999,7 +3953,7 @@ private final class SettingsController: NSObject {
 
         pendingPicker.onPick = { [weak self] url in
             self?.addPopover.performClose(nil)
-            _ = self?.model.addTarget(url: url)
+            if self?.model.addTarget(url: url) == true { self?.resetListFilter() }
         }
         pendingPicker.onChooseFromDisk = { [weak self] in
             self?.addPopover.performClose(nil)
@@ -3008,34 +3962,164 @@ private final class SettingsController: NSObject {
         addPopover.contentViewController = pendingPicker
         addPopover.behavior = .transient
         helpPopover.behavior = .transient
-        applyColorTheme(rebuildRows: false)
         applyAccessibilityChrome()
 
-        let rootStack = verticalStack(
-            [header, applicationsCard, permissionRow, loginButton, guideButton, guideCard, appGuideButton, appGuideCard],
-            spacing: 10
-        )
+        preferencesButton.title = "设置与帮助…"
+        preferencesButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        preferencesButton.imagePosition = .imageLeading
+        preferencesButton.bezelStyle = .rounded
+        preferencesButton.controlSize = .small
+        preferencesButton.target = self
+        preferencesButton.action = #selector(showPreferences)
+        preferencesButton.setAccessibilityLabel("设置与帮助")
+        let footerHint = NSTextField(labelWithString: model.previewMode
+            ? "配置副本 · 预览不会更改实际快捷键"
+            : "点应用呼出 · 点快捷键改键 · ⌘F 搜索")
+        footerHint.font = .systemFont(ofSize: 11)
+        footerHint.textColor = .secondaryLabelColor
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = horizontalStack([footerHint, footerSpacer, preferencesButton], spacing: 10)
+        footer.alignment = .centerY
+        buildPreferencesPanel(views: [runtimeCard, guideButton, guideCard, appGuideButton, appGuideCard])
+
+        let rootStack = verticalStack([header, applicationsCard, statusBanner, footer], spacing: 12)
         rootStack.translatesAutoresizingMaskIntoConstraints = false
         material.addSubview(rootStack)
         header.setContentHuggingPriority(.required, for: .vertical)
-        loginButton.setContentHuggingPriority(.required, for: .vertical)
+        statusBanner.setContentHuggingPriority(.required, for: .vertical)
+        footer.setContentHuggingPriority(.required, for: .vertical)
         guideButton.setContentHuggingPriority(.required, for: .vertical)
         appGuideButton.setContentHuggingPriority(.required, for: .vertical)
         NSLayoutConstraint.activate([
             rootStack.leadingAnchor.constraint(equalTo: material.leadingAnchor, constant: 20),
             rootStack.trailingAnchor.constraint(equalTo: material.trailingAnchor, constant: -20),
-            rootStack.topAnchor.constraint(equalTo: material.topAnchor, constant: 36),
+            rootStack.topAnchor.constraint(equalTo: material.topAnchor, constant: 42),
             rootStack.bottomAnchor.constraint(equalTo: material.bottomAnchor, constant: -14),
             header.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             applicationsCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            permissionRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            loginButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            guideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            guideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            appGuideButton.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            appGuideCard.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
+            statusBanner.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            footer.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
         ])
         window.initialFirstResponder = addButton
+    }
+
+    private func buildPreferencesPanel(views: [NSView]) {
+        let panel = QuickToggleWindow(contentRect: NSRect(x: 0, y: 0, width: 590, height: 530),
+                                      styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        panel.title = "设置与帮助"
+        panel.minSize = NSSize(width: 570, height: 510)
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        let title = NSTextField(labelWithString: "按你的习惯使用轻唤")
+        title.font = .systemFont(ofSize: 17, weight: .semibold)
+        let note = NSTextField(wrappingLabelWithString: "普通快捷键添加后即可使用；需要 fn 快捷键或恢复最小化窗口时，再开启辅助功能。")
+        note.font = .systemFont(ofSize: 12)
+        note.textColor = .secondaryLabelColor
+        preferencesStatus.font = .systemFont(ofSize: 11.5)
+        preferencesStatus.maximumNumberOfLines = 3
+        let done = NSButton(title: "完成", target: self, action: #selector(closePreferences))
+        done.bezelStyle = .rounded
+        done.keyEquivalent = "\r"
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let version = NSTextField(labelWithString: "QuickToggle · \(appVersion)\(model.previewMode ? " · 预览" : "")")
+        version.font = .systemFont(ofSize: 11)
+        version.textColor = .tertiaryLabelColor
+        let footer = horizontalStack([version, spacer, done], spacing: 8)
+        let content = FlippedStackView(views: [title, note] + views)
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 12
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = content
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            content.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        scroll.setContentHuggingPriority(.init(1), for: .vertical)
+        scroll.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        guard let container = panel.contentView else { return }
+        let root = verticalStack([scroll, preferencesStatus, footer], spacing: 12)
+        pin(root, inside: container, insets: NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20))
+        root.arrangedSubviews.forEach { $0.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true }
+        content.arrangedSubviews.forEach { $0.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
+        views.forEach { $0.setContentHuggingPriority(.required, for: .vertical) }
+        panel.initialFirstResponder = loginButton
+        preferencesPanel = panel
+    }
+
+    @objc private func showPreferences() {
+        guard let panel = preferencesPanel, window.attachedSheet == nil else { return }
+        refresh()
+        window.beginSheet(panel)
+    }
+
+    @objc private func closePreferences() {
+        guard let panel = preferencesPanel, panel.sheetParent != nil else { return }
+        window.endSheet(panel)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === preferencesPanel { closePreferences(); return false }
+        return true
+    }
+
+    private func focusSearch() {
+        guard window.attachedSheet == nil else { return }
+        window.makeFirstResponder(searchField)
+        searchField.selectText(nil)
+    }
+
+    func controlTextDidChange(_ obj: Notification) { rebuildBindingRows() }
+
+    @objc private func changeScope() {
+        rebuildBindingRows()
+        listScroll.contentView.scroll(to: .zero)
+        listScroll.reflectScrolledClipView(listScroll.contentView)
+    }
+
+    @objc private func resetListFilter() {
+        searchField.stringValue = ""
+        scopeControl.selectedSegment = ApplicationListScope.all.rawValue
+        changeScope()
+    }
+
+    @objc private func showOccupiedEditor() {
+        appGuideExpanded = true
+        guideExpanded = false
+        updateGuideVisibility()
+        showPreferences()
+    }
+
+    private func makeFilteredEmptyState(scope: ApplicationListScope) -> NSView {
+        let searching = !searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let symbol = NSImageView()
+        symbol.image = NSImage(systemSymbolName: searching ? "magnifyingglass" : "checkmark.circle", accessibilityDescription: nil)
+        symbol.contentTintColor = .tertiaryLabelColor
+        symbol.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        symbol.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        let title = NSTextField(labelWithString: searching ? "没有找到匹配项" : (scope == .occupied ? "还没有占用记录" : "每个应用都有快捷键了"))
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        let detail = NSTextField(wrappingLabelWithString: searching
+            ? "试试应用名称或 ⌘4 这样的快捷键，也可以回到全部应用。"
+            : (scope == .occupied ? "记录其他软件已占用的组合，添加应用时会自动避开。" : "回到全部应用，点击行内快捷键即可修改。"))
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = .secondaryLabelColor
+        detail.alignment = .center
+        let button = NSButton(title: !searching && scope == .occupied ? "添加占用记录…" : "显示全部应用",
+                              target: self, action: !searching && scope == .occupied ? #selector(showOccupiedEditor) : #selector(resetListFilter))
+        button.bezelStyle = .rounded
+        let content = verticalStack([symbol, title, detail, button], spacing: 10)
+        content.alignment = .centerX
+        let container = NSView()
+        pin(content, inside: container, insets: NSEdgeInsets(top: 36, left: 20, bottom: 30, right: 20))
+        return container
     }
 
     private func rebuildBindingRows() {
@@ -3045,62 +4129,60 @@ private final class SettingsController: NSObject {
             bindingsStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
-
-        if model.bindings.isEmpty && model.occupiedHotKeys.isEmpty {
-            bindingsStack.addArrangedSubview(makeWelcomeCard())
-        } else {
-            let rows = model.bindings.map(QuickToggleRow.binding)
-                + model.occupiedHotKeys.map(QuickToggleRow.occupied)
-            BindingOrder.sorted(rows).forEach { row in
-                switch row {
-                case .binding(let binding):
-                    bindingsStack.addArrangedSubview(makeBindingRow(binding))
-                case .occupied(let entry):
-                    bindingsStack.addArrangedSubview(makeOccupiedInlineRow(entry))
-                }
+        rowStatusLabels.removeAll()
+        let scope = ApplicationListScope(rawValue: scopeControl.selectedSegment) ?? .all
+        addButton.title = scope == .occupied ? "添加占用…" : "添加应用…"
+        addButton.setAccessibilityLabel(scope == .occupied ? "添加占用记录" : "添加目标应用")
+        addButton.setAccessibilityHelp(scope == .occupied ? "记录其他软件已占用的组合，自动分配时会避开。" : "打开已安装应用列表；添加后自动分配一个可用的数字快捷键。")
+        let rows = ApplicationListFilter.rows(bindings: model.bindings, occupied: model.occupiedHotKeys, scope: scope, query: searchField.stringValue)
+        listTitle.stringValue = scope == .occupied ? "占用记录" : (scope == .needsShortcut ? "待设置快捷键" : "我的应用")
+        let total = scope == .occupied ? model.occupiedHotKeys.count : model.bindings.count
+        countLabel.stringValue = rows.count == total ? "\(total) 项" : "\(rows.count) / \(total) 项"
+        if rows.isEmpty {
+            let isFirstUse = scope == .all && model.bindings.isEmpty && searchField.stringValue.isEmpty
+            bindingsStack.addArrangedSubview(isFirstUse ? makeWelcomeCard() : makeFilteredEmptyState(scope: scope))
+        }
+        rows.forEach { row in
+            switch row {
+            case .binding(let binding):
+                bindingsStack.addArrangedSubview(makeBindingRow(binding))
+            case .occupied(let entry):
+                bindingsStack.addArrangedSubview(makeOccupiedInlineRow(entry))
             }
         }
+        let bottomSpacer = NSView()
+        bottomSpacer.setContentHuggingPriority(.init(1), for: .vertical)
+        bottomSpacer.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        bindingsStack.addArrangedSubview(bottomSpacer)
 
-        let width = max(listScroll.contentSize.width, 560)
-        bindingsStack.frame = NSRect(x: 0, y: 0, width: width, height: 1)
-        bindingsStack.layoutSubtreeIfNeeded()
-        bindingsStack.frame.size.height = max(bindingsStack.fittingSize.height, listScroll.contentSize.height)
         bindingsStack.arrangedSubviews.forEach {
             $0.widthAnchor.constraint(equalTo: bindingsStack.widthAnchor).isActive = true
         }
+        window.recalculateKeyViewLoop()
     }
 
     private func makeWelcomeCard() -> NSView {
-        let card = GlassCardView(frame: .zero)
+        let emptyState = NSView()
 
-        let title = NSTextField(labelWithString: "欢迎使用轻唤")
-        title.font = .systemFont(ofSize: 17, weight: .bold)
+        let title = NSTextField(labelWithString: "先添加一个常用应用")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
 
-        let hasFreeDigit = model.nextFreeCommandDigit != nil
-        let steps = hasFreeDigit
-            ? "1. 点下方「添加第一个应用」，从已安装的应用里选\n2. 轻唤自动分配空闲的 ⌘ 数字（第一个是 ⌘1），立即生效\n3. 按一下呼出应用，再按一下藏回去；想换键就点行内按钮重录"
-            : "1. 点下方「添加第一个应用」，从已安装的应用里选\n2. 点行内按钮录制快捷键，推荐 ⌘ + 数字\n3. 按一下呼出应用，再按一下藏回去；想换键就点行内按钮重录"
-        let guide = NSTextField(wrappingLabelWithString: steps)
+        let hasFreeDigit = model.nextFreeRecommendedDigit != nil
+        let message = hasFreeDigit
+            ? "点右上角“添加应用…”。轻唤会自动分配可用的数字快捷键，添加后即可使用。"
+            : "点右上角“添加应用…”，再点该应用的“未设置”按钮录制快捷键。"
+        let guide = NSTextField(wrappingLabelWithString: message)
         guide.font = .systemFont(ofSize: 12.5)
         guide.textColor = .secondaryLabelColor
         guide.alignment = .left
 
-        let start = NSButton(title: "添加第一个应用", target: self, action: #selector(chooseApplication))
-        start.bezelStyle = .rounded
-        start.controlSize = .large
-        start.bezelColor = colorTheme.primary
-        start.contentTintColor = .white
-        start.font = .systemFont(ofSize: 13.5, weight: .semibold)
-        start.setAccessibilityLabel("添加第一个应用")
-        start.setAccessibilityHelp("打开应用选择器，选中后轻唤会自动分配下一个空闲的 Command 数字键。")
-
-        let hint = NSTextField(labelWithString: "设置窗口本身的开关是 ⌘3，可随时在标题旁改。")
+        let hint = NSTextField(labelWithString: "之后可直接点快捷键按钮换键。")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .tertiaryLabelColor
 
-        let content = verticalStack([title, guide, start, hint], spacing: 10)
-        pin(content, inside: card, insets: NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20))
-        return card
+        let content = verticalStack([title, guide, hint], spacing: 6)
+        pin(content, inside: emptyState, insets: NSEdgeInsets(top: 22, left: 18, bottom: 22, right: 18))
+        return emptyState
     }
 
     private func makeOccupiedInlineRow(_ entry: OccupiedHotKeyEntry) -> NSView {
@@ -3116,6 +4198,11 @@ private final class SettingsController: NSObject {
         let badge = NSTextField(labelWithString: "本机占用")
         badge.font = .systemFont(ofSize: 10, weight: .semibold)
         badge.textColor = .systemOrange
+        let badgePill = NSView()
+        badgePill.wantsLayer = true
+        badgePill.layer?.cornerRadius = 5
+        badgePill.layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.15).cgColor
+        pin(badge, inside: badgePill, insets: NSEdgeInsets(top: 2, left: 6, bottom: 2, right: 6))
 
         let name = NSTextField(labelWithString: entry.name)
         name.font = .systemFont(ofSize: 12.5, weight: .semibold)
@@ -3137,7 +4224,7 @@ private final class SettingsController: NSObject {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let content = horizontalStack([badge, name, keys, spacer, remove], spacing: 8)
+        let content = horizontalStack([badgePill, name, keys, spacer, remove], spacing: 8)
         pin(content, inside: row, insets: NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10))
         return row
     }
@@ -3159,14 +4246,17 @@ private final class SettingsController: NSObject {
     }
 
     private func makeBindingRow(_ binding: AppBinding) -> NSView {
-        let row = NSBox()
+        let row = BindingActionRow()
+        row.onPress = { [weak self] in self?.model.handleHotKey(binding.id) }
         row.boxType = .custom
         row.cornerRadius = 8
         row.borderWidth = 1
-        row.borderColor = .separatorColor.withAlphaComponent(0.45)
-        row.fillColor = .controlBackgroundColor.withAlphaComponent(0.34)
-        row.heightAnchor.constraint(equalToConstant: 56).isActive = true
+        row.borderColor = .clear
+        row.fillColor = .clear
+        row.heightAnchor.constraint(equalToConstant: 64).isActive = true
         row.setAccessibilityLabel("\(binding.target.name) 快捷键设置")
+        row.setAccessibilityHelp("点图标、名称或空白处呼出或恢复应用；聚焦这一行后也可按空格或回车。")
+        row.toolTip = "呼出或恢复 \(binding.target.name)，等同按它的快捷键"
 
         let icon = NSImageView()
         icon.image = sizedApplicationIcon(at: binding.target.path, pointSize: 32)
@@ -3179,20 +4269,28 @@ private final class SettingsController: NSObject {
         name.font = .systemFont(ofSize: 13, weight: .semibold)
         name.lineBreakMode = .byTruncatingTail
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        name.toolTip = binding.target.name
 
-        let autoOpen = NSButton(checkboxWithTitle: "未运行时自动打开", target: self, action: #selector(toggleLaunchIfNeeded(_:)))
+        let autoOpen = NSButton(checkboxWithTitle: "未运行时打开", target: self, action: #selector(toggleLaunchIfNeeded(_:)))
         autoOpen.identifier = NSUserInterfaceItemIdentifier(binding.id.uuidString)
         autoOpen.state = binding.launchIfNeeded ? .on : .off
         autoOpen.controlSize = .mini
         autoOpen.font = .systemFont(ofSize: 11)
         autoOpen.setAccessibilityLabel("\(binding.target.name) 未运行时自动打开")
-        let labels = verticalStack([name, autoOpen], spacing: 1)
+        let state = model.shortcutState(for: binding)
+        let registration = NSTextField(labelWithString: state.text)
+        registration.font = .systemFont(ofSize: 10.5)
+        registration.textColor = state.color
+        registration.setAccessibilityLabel("\(binding.target.name) 快捷键状态")
+        rowStatusLabels[binding.id] = registration
+        let secondary = horizontalStack([registration, autoOpen], spacing: 9)
+        secondary.alignment = .centerY
+        let labels = verticalStack([name, secondary], spacing: 3)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let recorder = ShortcutRecorderButton(frame: .zero)
-        recorder.bezelColor = colorTheme.recorder
         recorder.shortcut = binding.shortcut
         recorder.onRecord = { [weak self] shortcut in
             self?.model.applyShortcut(shortcut, for: binding.id) == true
@@ -3213,7 +4311,13 @@ private final class SettingsController: NSObject {
         } else if let recommended = SuggestedToggleApps.shortcut(for: binding.target.bundleIdentifier) {
             recorder.toolTip = "推荐 \(recommended.displayName)。点此录制或改键，改完立即生效。"
         } else {
-            recorder.toolTip = "推荐 ⌘0–9、⌘⌥K、⌘⇧K、⌃⇧K；冲突时保留原快捷键"
+            recorder.toolTip = "优先推荐 ⌘0–9，用尽后推荐 fn/🌐0–9；系统冲突会阻止或警告"
+        }
+        if let shortcut = binding.shortcut,
+           let warning = model.conflictWarning(for: shortcut) {
+            recorder.toolTip = [recorder.toolTip, "⚠︎ \(warning)"]
+                .compactMap { $0 }
+                .joined(separator: "\n")
         }
 
         let helpButton = NSButton()
@@ -3263,8 +4367,7 @@ private final class SettingsController: NSObject {
         let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: item.0, accessibilityDescription: item.1)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .medium))
-        icon.contentTintColor = colorTheme.primary
-        guideAccentIcons.append(icon)
+        icon.contentTintColor = .secondaryLabelColor
         icon.widthAnchor.constraint(equalToConstant: 20).isActive = true
         icon.heightAnchor.constraint(equalToConstant: 20).isActive = true
 
@@ -3357,6 +4460,11 @@ private final class SettingsController: NSObject {
     }
 
     @objc private func chooseApplication() {
+        if scopeControl.selectedSegment == ApplicationListScope.occupied.rawValue {
+            showOccupiedEditor()
+            return
+        }
+        guard window.attachedSheet == nil else { return }
         if addPopover.isShown {
             addPopover.performClose(nil)
             return
@@ -3377,7 +4485,7 @@ private final class SettingsController: NSObject {
         panel.canChooseDirectories = false
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        _ = model.addTarget(url: url)
+        if model.addTarget(url: url) { resetListFilter() }
     }
 
     @objc private func showBindingHelp(_ sender: NSButton) {
@@ -3422,23 +4530,6 @@ private final class SettingsController: NSObject {
         loginButton.toolTip = model.loginAtLaunchHelp
     }
 
-    @objc private func selectTheme() {
-        colorTheme = themeControl.selectedSegment == 1 ? .ember : .aurora
-        UserDefaults.standard.set(colorTheme.rawValue, forKey: "quickToggle.colorTheme")
-        applyColorTheme(rebuildRows: true)
-    }
-
-    private func applyColorTheme(rebuildRows: Bool) {
-        accentRail.theme = colorTheme
-        addButton.bezelColor = colorTheme.primary
-        settingsShortcutRecorder.bezelColor = colorTheme.recorder
-        permissionIcon.contentTintColor = colorTheme.primary
-        guideAccentIcons.forEach { $0.contentTintColor = colorTheme.primary }
-        enableButton.bezelColor = model.isEnabled ? colorTheme.primary : nil
-        applyAccessibilityChrome()
-        if rebuildRows { rebuildBindingRows() }
-    }
-
     private func applyAccessibilityChrome() {
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         window.isOpaque = reduced
@@ -3474,26 +4565,74 @@ private final class SettingsController: NSObject {
         )
         window.recalculateKeyViewLoop()
     }
+
+    func interfaceLayoutFailures() -> [String] {
+        var failures: [String] = []
+        for size in [NSSize(width: 600, height: 500), NSSize(width: 760, height: 690), NSSize(width: 1080, height: 760)] {
+            window.setContentSize(size)
+            window.contentView?.layoutSubtreeIfNeeded()
+            guard let root = window.contentView else { continue }
+            for (name, view) in [("search", searchField as NSView), ("add", addButton), ("feedback", statusBanner), ("preferences", preferencesButton)] {
+                let rect = view.convert(view.bounds, to: root)
+                if rect.width < 20 || rect.height < 10 || !root.bounds.insetBy(dx: -1, dy: -1).contains(rect) {
+                    failures.append("\(name) clipped at \(Int(size.width))x\(Int(size.height)): \(rect)")
+                }
+            }
+            if abs(bindingsStack.bounds.width - listScroll.contentSize.width) > 1 {
+                failures.append("list width did not track viewport at \(Int(size.width))")
+            }
+            if let first = bindingsStack.arrangedSubviews.first {
+                let rowRect = first.convert(first.bounds, to: listScroll.contentView)
+                if !listScroll.contentView.bounds.insetBy(dx: -1, dy: -1).contains(rowRect) {
+                    failures.append("first row starts outside viewport at \(Int(size.width)): \(rowRect), viewport \(listScroll.contentView.bounds)")
+                }
+            }
+        }
+        let mainSize = window.frame.size
+        guideExpanded = true
+        updateGuideVisibility()
+        preferencesPanel?.contentView?.layoutSubtreeIfNeeded()
+        if window.frame.size != mainSize { failures.append("help expansion resized the application window") }
+        guideExpanded = false
+        updateGuideVisibility()
+        if let raw = ProcessInfo.processInfo.environment["QUICKTOGGLE_RENDER_DIR"], !raw.isEmpty {
+            let directory = URL(fileURLWithPath: raw, isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                window.setContentSize(NSSize(width: 760, height: 690))
+                for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", NSAppearance.Name.darkAqua)] {
+                    window.appearance = NSAppearance(named: appearance)
+                    guard let root = window.contentView else { continue }
+                    root.layoutSubtreeIfNeeded()
+                    var imageData: Data?
+                    window.effectiveAppearance.performAsCurrentDrawingAppearance {
+                        guard let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { return }
+                        root.cacheDisplay(in: root.bounds, to: bitmap)
+                        imageData = bitmap.representation(using: .png, properties: [:])
+                    }
+                    if let imageData { try imageData.write(to: directory.appendingPathComponent("layout-\(name).png")) }
+                    else { failures.append("\(name) appearance produced no image") }
+                }
+            } catch { failures.append("appearance render failed: \(error)") }
+        }
+        return failures
+    }
 }
 // MARK: - Menu bar application
 
-private enum LaunchMode {
-    case normal
-    case smoke
-    case idleMeasure
-}
-
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let mode: LaunchMode
     private let model: QuickToggleModel
     private var statusItem: NSStatusItem?
     private var settings: SettingsController?
     private var previousApplication: NSRunningApplication?
     private var lastHotKeyRecovery = Date.distantPast
 
-    init(mode: LaunchMode) {
-        self.mode = mode
-        model = QuickToggleModel(diagnosticMode: mode != .normal)
+    override init() {
+        #if QUICKTOGGLE_PREVIEW
+        model = QuickToggleModel(diagnosticMode: true, previewMode: true)
+        #else
+        model = QuickToggleModel(diagnosticMode: false)
+        #endif
         super.init()
         model.onChange = { [weak self] in self?.refreshInterface() }
         model.onSettingsHotKey = { [weak self] in
@@ -3504,27 +4643,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installMainMenu()
         installStatusItem()
         observeWorkspaceRecovery()
-
-        switch mode {
-        case .normal:
-            if model.bindings.isEmpty || model.bindings.allSatisfy({ $0.shortcut == nil }) {
-                DispatchQueue.main.async { [weak self] in self?.showSettings() }
-            }
-        case .smoke:
-            showSettings()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                guard let self else { exit(1) }
-                let shown = self.statusItem?.button != nil && self.settings?.window.isVisible == true
-                self.toggleSettings()
-                let passed = shown && self.settings?.window.isVisible == false
-                print(passed ? "GUI smoke passed" : "GUI smoke failed")
-                exit(passed ? 0 : 1)
-            }
-        case .idleMeasure:
-            break
+        if model.previewMode || model.bindings.isEmpty || model.bindings.allSatisfy({ $0.shortcut == nil }) {
+            DispatchQueue.main.async { [weak self] in self?.showSettings() }
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showSettings()
+        return true
+    }
+
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        addMenuItem("打开轻唤", action: #selector(showSettingsAction), key: ",", to: appMenu)
+        addMenuItem("退出轻唤", action: #selector(quitAction), key: "q", to: appMenu)
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+        let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "编辑")
+        for (title, action, key) in [("撤销", "undo:", "z"), ("剪切", "cut:", "x"), ("复制", "copy:", "c"), ("粘贴", "paste:", "v"), ("全选", "selectAll:", "a")] {
+            editMenu.addItem(NSMenuItem(title: title, action: NSSelectorFromString(action), keyEquivalent: key))
+        }
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -3554,50 +4701,51 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private static let displayVersion: String = {
-        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        return "\(short) (build \(build))"
+        return "\(appVersion) (build \(build))"
     }()
 
     private func refreshMenu() {
         guard let statusItem else { return }
         let menu = NSMenu()
-        let state = NSMenuItem(title: model.statusMessage, action: nil, keyEquivalent: "")
+        addMenuItem("打开轻唤", action: #selector(showSettingsAction), key: ",", to: menu)
+        let state = NSMenuItem(title: model.previewMode ? "界面预览 · 配置副本" : (model.isEnabled ? "\(model.registeredShortcutCount) 个应用快捷键已注册" : "应用快捷键已暂停"), action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
         let version = NSMenuItem(title: "轻唤 \(Self.displayVersion)", action: nil, keyEquivalent: "")
         version.isEnabled = false
-        menu.addItem(version)
-
-        let rows = model.bindings.map(QuickToggleRow.binding)
-            + model.occupiedHotKeys.map(QuickToggleRow.occupied)
-        for row in BindingOrder.sorted(rows) {
-            let title: String
-            switch row {
-            case .binding(let binding):
-                let shortcut = binding.shortcut?.displayName ?? "未设置"
-                title = "\(binding.target.name)：\(shortcut)"
-            case .occupied(let entry):
-                title = "\(entry.name)：\(entry.shortcut.displayName)（本机占用）"
+        let appsItem = NSMenuItem(title: "呼出应用", action: nil, keyEquivalent: "")
+        let appsMenu = NSMenu(title: "呼出应用")
+        for row in BindingOrder.sorted(model.bindings.map(QuickToggleRow.binding)) {
+            guard case .binding(let binding) = row else { continue }
+            let item = NSMenuItem(title: "\(binding.target.name)    \(binding.shortcut?.displayName ?? "未设置")", action: #selector(toggleApplicationAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = binding.id.uuidString
+            if let icon = NSWorkspace.shared.icon(forFile: binding.target.path).copy() as? NSImage {
+                icon.size = NSSize(width: 16, height: 16)
+                item.image = icon
             }
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
+            appsMenu.addItem(item)
         }
-        let settingsShortcut = NSMenuItem(
-            title: "显示/隐藏设置：\(model.settingsShortcut.displayName)",
-            action: nil,
-            keyEquivalent: ""
-        )
-        settingsShortcut.isEnabled = false
-        menu.addItem(settingsShortcut)
+        appsItem.submenu = appsMenu
+        appsItem.isEnabled = !model.bindings.isEmpty
+        menu.addItem(appsItem)
 
         menu.addItem(.separator())
-        addMenuItem("显示设置", action: #selector(showSettingsAction), key: ",", to: menu)
         addMenuItem(model.isEnabled ? "停用全部快捷键" : "启用全部快捷键", action: #selector(toggleEnabledAction), to: menu)
         addMenuItem("申请辅助功能权限", action: #selector(requestAccessibilityAction), to: menu)
         addMenuItem("导出配置…", action: #selector(exportConfigurationAction), to: menu)
         addMenuItem("导入配置…", action: #selector(importConfigurationAction), to: menu)
+        let detailsItem = NSMenuItem(title: "状态与版本", action: nil, keyEquivalent: "")
+        let details = NSMenu(title: "状态与版本")
+        details.addItem(version)
+        for text in [model.statusMessage, model.diagnosticSummary, "打开轻唤：\(model.settingsShortcut.displayName)"] {
+            let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            details.addItem(item)
+        }
+        detailsItem.submenu = details
+        menu.addItem(detailsItem)
         menu.addItem(.separator())
         addMenuItem("退出", action: #selector(quitAction), key: "q", to: menu)
         menu.delegate = self
@@ -3646,6 +4794,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         showSettings()
     }
     @objc private func toggleEnabledAction() { model.toggleEnabled() }
+    @objc private func toggleApplicationAction(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String, let id = UUID(uuidString: value) else { return }
+        model.handleHotKey(id)
+    }
     @objc private func requestAccessibilityAction() { model.requestAccessibility() }
 
     @objc private func exportConfigurationAction() {
@@ -3715,7 +4867,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func quitAction() { NSApp.terminate(nil) }
 
     private func observeWorkspaceRecovery() {
-        guard mode == .normal else { return }
         let workspace = NSWorkspace.shared.notificationCenter
         workspace.addObserver(
             self,
@@ -3748,7 +4899,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func recoverHotKeysIfNeeded(force: Bool = false) {
-        guard mode == .normal else { return }
         if relaunchIfOnDiskBuildIsNewer() { return }
         if !force, Date().timeIntervalSince(lastHotKeyRecovery) < 2 { return }
         lastHotKeyRecovery = Date()
@@ -3777,17 +4927,153 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 // MARK: - Runnable self-test
 
 private enum SelfTest {
+    static func runComponentSmoke() -> Bool {
+        let model = QuickToggleModel(diagnosticMode: true)
+        defer { model.close() }
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "诊断：\(model.diagnosticSummary)", action: nil, keyEquivalent: ""))
+        let binding = AppBinding(
+            id: UUID(),
+            target: TargetApplication(
+                bundleIdentifier: "com.quicktoggle.smoke",
+                name: "Smoke",
+                path: "/Applications/Smoke.app"
+            ),
+            shortcut: Shortcut(
+                keyCode: UInt32(kVK_ANSI_K),
+                modifiers: UInt32(cmdKey | shiftKey),
+                label: "K"
+            ),
+            launchIfNeeded: true
+        )
+        let payload = ConfigurationExchange.makePayload(
+            bindings: [binding],
+            settingsShortcut: model.settingsShortcut,
+            enabled: model.isEnabled,
+            launchIfNeeded: true,
+            importedVerifiedLaunchIDs: [],
+            importedSuggestedAppIDs: [],
+            occupiedHotKeys: [],
+            appVersion: "smoke"
+        )
+        let roundTrip = ConfigurationExchange.encode(payload).flatMap(ConfigurationExchange.decode)
+        let passed = menu.items.count == 1
+            && menu.items[0].title.contains("诊断：0 个应用")
+            && model.settingsShortcut.displayName == "⌘3"
+            && roundTrip == payload
+        print(passed ? "Menu/model smoke passed" : "Menu/model smoke failed")
+        return checkBindingRowInteraction() && passed
+    }
+
+    private static func checkBindingRowInteraction() -> Bool {
+        let parent = NSView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        let row = BindingActionRow(frame: NSRect(x: 20, y: 20, width: 580, height: 60))
+        row.boxType = .custom
+        parent.addSubview(row)
+        let name = NSTextField(labelWithString: "Synthetic app")
+        name.frame = NSRect(x: 55, y: 20, width: 150, height: 20)
+        let icon = NSImageView(frame: NSRect(x: 10, y: 15, width: 32, height: 32))
+        let recorder = NSButton(title: "Record", target: nil, action: nil)
+        recorder.frame = NSRect(x: 400, y: 15, width: 80, height: 30)
+        let checkbox = NSButton(checkboxWithTitle: "Auto open", target: nil, action: nil)
+        checkbox.frame = NSRect(x: 220, y: 15, width: 120, height: 30)
+        [name, icon, recorder, checkbox].forEach { row.addSubview($0) }
+        var firstPresses = 0
+        var secondPresses = 0
+        row.onPress = { firstPresses += 1 }
+        let other = BindingActionRow(frame: NSRect(x: 20, y: 100, width: 580, height: 60))
+        other.boxType = .custom
+        other.onPress = { secondPresses += 1 }
+        parent.addSubview(other)
+        guard let click = NSEvent.mouseEvent(
+            with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+        ) else { return false }
+        func center(_ view: NSView) -> NSPoint {
+            view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: parent)
+        }
+        var passed = true
+        for point in [center(name), center(icon), row.convert(NSPoint(x: 370, y: 30), to: parent)] {
+            let hit = row.hitTest(point)
+            passed = (hit === row) && passed
+            hit?.mouseDown(with: click)
+        }
+        passed = firstPresses == 3 && passed
+        passed = (row.hitTest(center(recorder)) === recorder) && passed
+        passed = (row.hitTest(center(checkbox)) === checkbox) && passed
+        passed = row.hitTest(NSPoint(x: -10, y: -10)) == nil && passed
+        other.hitTest(center(other))?.mouseDown(with: click)
+        passed = secondPresses == 1 && firstPresses == 3 && passed
+        row.frame.origin = NSPoint(x: 35, y: 175)
+        passed = (row.hitTest(center(name)) === row) && passed
+        passed = row.acceptsFirstResponder && row.accessibilityPerformPress() && passed
+        for code in [UInt16(kVK_Space), UInt16(kVK_Return)] {
+            for repeating in [false, true] {
+                guard let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: 0, context: nil, characters: " ", charactersIgnoringModifiers: " ",
+                    isARepeat: repeating, keyCode: code
+                ) else { return false }
+                row.keyDown(with: event)
+            }
+        }
+        passed = firstPresses == 6 && secondPresses == 1 && passed
+        print(passed ? "Binding row mouse/control/keyboard/accessibility routing passed" : "Binding row interaction failed")
+        return passed
+    }
+
+    static func runIdleMeasure() {
+        let model = QuickToggleModel(diagnosticMode: true)
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: model.diagnosticSummary, action: nil, keyEquivalent: ""))
+        withExtendedLifetime((model, menu)) {
+            RunLoop.current.run(until: Date().addingTimeInterval(2))
+            var previousCPU = processUsage.cpuSeconds
+            var previousDate = Date()
+            var cpuTotal = 0.0
+            var rssTotal = 0.0
+            for _ in 0..<5 {
+                RunLoop.current.run(until: Date().addingTimeInterval(1))
+                let now = Date()
+                let usage = processUsage
+                let elapsed = max(now.timeIntervalSince(previousDate), 0.001)
+                cpuTotal += max(usage.cpuSeconds - previousCPU, 0) / elapsed * 100
+                rssTotal += usage.peakRSSKilobytes
+                previousCPU = usage.cpuSeconds
+                previousDate = now
+            }
+            print(String(format: "空闲 CPU 平均值: %.2f%%", cpuTotal / 5))
+            print(String(format: "空闲 RSS 峰值平均: %.0f KB (%.1f MB)", rssTotal / 5, rssTotal / 5 / 1024))
+        }
+        model.close()
+        print("Idle measurement complete")
+    }
+
+    private static var processUsage: (cpuSeconds: Double, peakRSSKilobytes: Double) {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return (0, 0) }
+        let user = Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
+        let system = Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
+        // On Darwin ru_maxrss is bytes, unlike Linux where it is kilobytes.
+        return (user + system, Double(usage.ru_maxrss) / 1024)
+    }
+
     static func run() -> Bool {
         var failures: [String] = []
         checkShortcutRules(&failures)
+        checkSystemKeyboardOverlap(&failures)
         checkTransaction(&failures)
+        checkHotKeyPressState(&failures)
         checkStateMachine(&failures)
+        checkLaunchAttemptState(&failures)
         checkLaunchPolicy(&failures)
         checkRevealPolicy(&failures)
         checkWindowPresence(&failures)
         checkHotKeyRouting(&failures)
         checkHotKeyRebind(&failures)
         checkMultiBindingPreferences(&failures)
+        checkShortcutConflictKnowledge(&failures)
         checkOccupiedHotKeys(&failures)
         checkShortcutSuggester(&failures)
         checkBindingOrder(&failures)
@@ -3798,6 +5084,8 @@ private enum SelfTest {
         checkStatusPolicy(&failures)
         checkLoginAtLaunch(&failures)
         checkIconNormalizer(&failures)
+        checkDiagnosticSummary(&failures)
+        checkApplicationFiltering(&failures)
 
         if failures.isEmpty {
             print("QuickToggle self-test passed")
@@ -3821,6 +5109,14 @@ private enum SelfTest {
         let settingsDefault = Shortcut(keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(cmdKey), label: "3")
         let appNumber = Shortcut(keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(cmdKey), label: "4")
         let unsafeSingleModifier = Shortcut(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(cmdKey), label: "K")
+        let functionDigit = Shortcut(keyCode: UInt32(kVK_ANSI_7), modifiers: fnModifierMask, label: "7")
+        let reservedFunctionQ = Shortcut(keyCode: UInt32(kVK_ANSI_Q), modifiers: fnModifierMask, label: "Q")
+        let functionFKey = Shortcut(keyCode: UInt32(kVK_F1), modifiers: fnModifierMask, label: "F1")
+        let stackedFunction = Shortcut(
+            keyCode: UInt32(kVK_ANSI_7),
+            modifiers: fnModifierMask | UInt32(cmdKey),
+            label: "7"
+        )
         let firstID = UUID()
         let bound = AppBinding(
             id: firstID,
@@ -3840,11 +5136,66 @@ private enum SelfTest {
         if appNumber.validationError != nil { failures.append("Command-number app shortcut was rejected") }
         if settingsDefault.settingsValidationError != nil { failures.append("default settings shortcut was rejected") }
         if unsafeSingleModifier.settingsValidationError == nil { failures.append("unsafe single-modifier settings shortcut was accepted") }
+        if functionDigit.validationError != nil || functionDigit.settingsValidationError != nil
+            || functionDigit.displayName != "fn7" {
+            failures.append("fn+digit was not accepted and displayed")
+        }
+        if reservedFunctionQ.validationError == nil {
+            failures.append("reserved fn+Q was accepted")
+        }
+        if functionFKey.validationError?.contains("标准功能键") != true {
+            failures.append("fn+F1 did not explain the function-key mode overlap")
+        }
+        if stackedFunction.validationError == nil {
+            failures.append("fn+digit stacked with another modifier was accepted")
+        }
+        if functionDigit.riskWarning?.contains("无法检测所有") != true {
+            failures.append("fn+digit did not disclose undetectable conflicts")
+        }
+        let functionEvent = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [.function],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "7",
+            charactersIgnoringModifiers: "7",
+            isARepeat: false,
+            keyCode: UInt16(kVK_ANSI_7)
+        )
+        if functionEvent.flatMap(Shortcut.from(event:)) != functionDigit {
+            failures.append("shortcut recorder did not preserve NSEvent.function")
+        }
         if !shortcutIsUsed(valid, in: [bound], excluding: UUID()) {
             failures.append("duplicate app shortcut was not detected")
         }
         if shortcutIsUsed(valid, in: [bound], excluding: firstID) {
             failures.append("binding conflicted with its own shortcut")
+        }
+    }
+
+    private static func checkSystemKeyboardOverlap(_ failures: inout [String]) {
+        if UInt64(fnModifierMask) != CGEventFlags.maskSecondaryFn.rawValue {
+            failures.append("persisted fn modifier did not match CGEventFlags.maskSecondaryFn")
+        }
+        if SystemKeyboardOverlap.globePressAction(from: NSNumber(value: 0)) != .none
+            || SystemKeyboardOverlap.globePressAction(from: NSNumber(value: 1)) != .switchInputSource
+            || SystemKeyboardOverlap.globePressAction(from: NSNumber(value: 2)) != .emojiAndSymbols
+            || SystemKeyboardOverlap.globePressAction(from: NSNumber(value: 3)) != .dictation
+            || SystemKeyboardOverlap.globePressAction(from: NSNumber(value: 9)) != .unknown(9) {
+            failures.append("Globe press action preference mapping was incomplete")
+        }
+        if !SystemKeyboardOverlap.standardFunctionKeyModeDescription(from: NSNumber(value: true))
+            .contains("已开启")
+            || !SystemKeyboardOverlap.standardFunctionKeyModeDescription(from: NSNumber(value: false))
+            .contains("已关闭") {
+            failures.append("standard function-key preference mapping was incomplete")
+        }
+        if !FunctionHotKeyCenter.hasExactFunctionModifier(.maskSecondaryFn)
+            || FunctionHotKeyCenter.hasExactFunctionModifier([.maskSecondaryFn, .maskCommand])
+            || FunctionHotKeyCenter.hasExactFunctionModifier(.maskCommand) {
+            failures.append("fn event-tap modifier matching was not exact")
         }
     }
 
@@ -3879,6 +5230,62 @@ private enum SelfTest {
         )
         if unregisterFailure != .failure(.failed) || rolledBack != [4] {
             failures.append("candidate was not rolled back after old unregistration failed")
+        }
+    }
+
+    private static func checkHotKeyPressState(_ failures: inout [String]) {
+        var state = HotKeyPressState()
+        if !state.acceptPress() {
+            failures.append("first physical hot key press was rejected")
+        }
+        if state.acceptPress() {
+            failures.append("repeated hot key press was accepted before release")
+        }
+        state.release()
+        if !state.acceptPress() {
+            failures.append("hot key press was not accepted after release")
+        }
+        state.reset()
+        if state.isPressed || !state.acceptPress() {
+            failures.append("hot key press state did not reset on rebind")
+        }
+
+        var generations = HotKeyGenerationState()
+        let first = generations.nextGeneration
+        generations.activate(first)
+        let second = generations.nextGeneration
+        generations.activate(second)
+        if generations.accepts(first) || !generations.accepts(second) {
+            failures.append("stale fn event-tap callback survived a newer registration")
+        }
+        generations.invalidate()
+        if generations.accepts(second) {
+            failures.append("fn event-tap callback survived registration invalidation")
+        }
+    }
+
+    private static func checkLaunchAttemptState(_ failures: inout [String]) {
+        var state = LaunchAttemptState()
+        let first = state.begin()
+        if !state.isLaunching {
+            failures.append("launch attempt did not enter the launching state")
+        }
+        if state.complete(first + 1) || !state.isLaunching {
+            failures.append("stale launch completion changed the active attempt")
+        }
+        if !state.invalidate(first) || state.isLaunching || state.complete(first) {
+            failures.append("timed-out launch completion was not invalidated")
+        }
+        let second = state.begin()
+        if state.complete(first) || !state.isLaunching {
+            failures.append("old launch completion replaced a newer attempt")
+        }
+        if !state.complete(second) || state.isLaunching {
+            failures.append("current launch completion was not accepted")
+        }
+        _ = state.invalidate()
+        if state.isLaunching {
+            failures.append("cancelled launch attempt remained active")
         }
     }
 
@@ -4194,6 +5601,18 @@ private enum SelfTest {
         if HotKeyManager.routes(eventSignature: first.routingSignature, to: second.routingSignature) {
             failures.append("hot key event leaked to another manager")
         }
+        let reservedFunction = Shortcut(
+            keyCode: UInt32(kVK_ANSI_Q),
+            modifiers: fnModifierMask,
+            label: "Q"
+        )
+        let reservedResult = first.replace(with: reservedFunction)
+        if case .failure(.failed) = reservedResult {
+            // Expected: even imported or stale persisted data cannot bypass validation.
+        } else {
+            failures.append("hot key manager registered a reserved non-digit fn combination")
+        }
+        if first.isActive { failures.append("rejected fn combination left a registration active") }
     }
 
     private static func checkRecorderGate(_ failures: inout [String]) {
@@ -4208,21 +5627,26 @@ private enum SelfTest {
     private static func checkHotKeyRebind(_ failures: inout [String]) {
         let manager = HotKeyManager()
         defer { manager.close() }
-        let shortcut = Shortcut(
-            keyCode: UInt32(kVK_F12),
-            modifiers: UInt32(controlKey | shiftKey),
-            label: "F12"
-        )
-        switch manager.replace(with: shortcut) {
-        case .failure(.occupied):
-            return
-        case .failure(.failed):
-            failures.append("hot key rebind setup failed")
-            return
-        case .success:
-            break
+        let candidates = [
+            Shortcut(keyCode: UInt32(kVK_F12), modifiers: UInt32(controlKey | shiftKey), label: "F12"),
+            Shortcut(keyCode: UInt32(kVK_F11), modifiers: UInt32(cmdKey | controlKey), label: "F11"),
+            Shortcut(keyCode: UInt32(kVK_F10), modifiers: UInt32(cmdKey | optionKey), label: "F10"),
+            Shortcut(keyCode: UInt32(kVK_F9), modifiers: UInt32(cmdKey | controlKey | shiftKey), label: "F9")
+        ]
+        var registered: Shortcut?
+        for shortcut in candidates {
+            if case .success = manager.replace(with: shortcut) {
+                registered = shortcut
+                break
+            }
         }
-        if case .failure = manager.rebind(shortcut) {
+        guard let registered else {
+            // A concurrently running QuickToggle or another utility may own every
+            // probe combination. Registration failures are covered by the model;
+            // avoid making the self-check disturb existing user hot keys.
+            return
+        }
+        if case .failure = manager.rebind(registered) {
             failures.append("rebinding the same hot key failed")
         }
         if !manager.isActive {
@@ -4268,6 +5692,54 @@ private enum SelfTest {
         store.saveBindings([migrated[0], second])
         if store.loadBindings().count != 2 {
             failures.append("multiple app bindings were not persisted")
+        }
+    }
+
+    private static func checkShortcutConflictKnowledge(_ failures: inout [String]) {
+        let suiteName = "com.quicktoggle.selftest.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            failures.append("could not create isolated conflict knowledge defaults")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = PreferenceStore(defaults: defaults)
+        if !store.loadShortcutConflictKnowledge().isEmpty {
+            failures.append("fresh conflict knowledge base was not empty")
+        }
+
+        let shortcut = Shortcut(
+            keyCode: UInt32(kVK_ANSI_K),
+            modifiers: UInt32(cmdKey | shiftKey),
+            label: "K"
+        )
+        let record = ShortcutConflictRecord(
+            application: "TestApp",
+            command: "Test Command",
+            applicationVersion: "1.0",
+            macOSVersion: "test",
+            verifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            result: "verified test fixture"
+        )
+        let knowledge = [ShortcutConflictKnowledgeBase.key(for: shortcut): [record]]
+        store.saveShortcutConflictKnowledge(knowledge)
+        let loaded = store.loadShortcutConflictKnowledge()
+        if loaded != knowledge {
+            failures.append("conflict knowledge was not persisted")
+        }
+        if ShortcutConflictKnowledgeBase.records(for: shortcut, in: loaded) != [record] {
+            failures.append("conflict knowledge lookup missed its shortcut")
+        }
+        if ShortcutConflictKnowledgeBase.warning(for: shortcut, in: loaded)
+            != "此组合在 TestApp 中是 Test Command 功能。" {
+            failures.append("conflict knowledge warning lost its app command")
+        }
+        let otherShortcut = Shortcut(
+            keyCode: UInt32(kVK_ANSI_J),
+            modifiers: UInt32(cmdKey | shiftKey),
+            label: "J"
+        )
+        if ShortcutConflictKnowledgeBase.warning(for: otherShortcut, in: loaded) != nil {
+            failures.append("conflict knowledge leaked across shortcuts")
         }
     }
 
@@ -4330,6 +5802,24 @@ private enum SelfTest {
         if inspected != .occupiedLocally("测试工具") {
             failures.append("shortcut probe missed a custom occupied entry")
         }
+
+        let functionOccupied = OccupiedHotKeyEntry(
+            name: "Fn 工具",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_5), modifiers: fnModifierMask, label: "5")
+        )
+        if OccupiedHotKeys.owner(of: functionOccupied.shortcut, in: [functionOccupied]) != "Fn 工具" {
+            failures.append("fn occupied shortcut did not resolve its owner")
+        }
+        let functionInspected = ShortcutProbe.inspect(
+            functionOccupied.shortcut,
+            bindings: [],
+            excluding: UUID(),
+            asSettings: false,
+            occupied: [functionOccupied]
+        )
+        if functionInspected != .occupiedLocally("Fn 工具") {
+            failures.append("shortcut probe missed an occupied fn combination")
+        }
     }
 
     private static func checkShortcutSuggester(_ failures: inout [String]) {
@@ -4380,6 +5870,60 @@ private enum SelfTest {
         if ShortcutSuggester.nextFreeCommandDigit(bindings: all, occupied: [], settingsShortcut: settings) != nil {
             failures.append("a fully allocated keyboard still suggested a command digit")
         }
+
+        let functionFallback = ShortcutSuggester.nextFreeRecommendedDigit(
+            bindings: all,
+            occupied: [],
+            settingsShortcut: settings
+        )
+        if functionFallback?.displayName != "fn1" {
+            failures.append("exhausted command digits did not fall back to fn+1")
+        }
+
+        let functionOneOccupied = OccupiedHotKeyEntry(
+            name: "Fn One",
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: fnModifierMask, label: "1")
+        )
+        let functionTwoBinding = AppBinding(
+            id: UUID(),
+            target: TargetApplication(bundleIdentifier: "test.fn2", name: "Fn2", path: "/Fn2.app"),
+            shortcut: Shortcut(keyCode: UInt32(kVK_ANSI_2), modifiers: fnModifierMask, label: "2"),
+            launchIfNeeded: true
+        )
+        let functionThreeSettings = Shortcut(
+            keyCode: UInt32(kVK_ANSI_3),
+            modifiers: fnModifierMask,
+            label: "3"
+        )
+        let functionFour = ShortcutSuggester.nextFreeFunctionDigit(
+            bindings: [functionTwoBinding],
+            occupied: [functionOneOccupied],
+            settingsShortcut: functionThreeSettings
+        )
+        if functionFour?.displayName != "fn4" {
+            failures.append("fn suggestion did not skip occupied, bound, and settings combinations")
+        }
+
+        let firstNineFunctionBindings = ShortcutSuggester.functionDigits.dropLast().enumerated().map {
+            index, digit in
+            AppBinding(
+                id: UUID(),
+                target: TargetApplication(
+                    bundleIdentifier: "test.fn.\(index)",
+                    name: "FnApp\(index)",
+                    path: "/FnApp\(index).app"
+                ),
+                shortcut: Shortcut(keyCode: digit.keyCode, modifiers: fnModifierMask, label: digit.label),
+                launchIfNeeded: true
+            )
+        }
+        if ShortcutSuggester.nextFreeFunctionDigit(
+            bindings: firstNineFunctionBindings,
+            occupied: [],
+            settingsShortcut: nil
+        )?.displayName != "fn0" {
+            failures.append("fn digit fallback did not include fn+0")
+        }
     }
 
     private static func checkBindingOrder(_ failures: inout [String]) {
@@ -4401,11 +5945,12 @@ private enum SelfTest {
             binding("Nine", keyCode: UInt32(kVK_ANSI_9), label: "9"),
             binding("None"),
             binding("Four", keyCode: UInt32(kVK_ANSI_4), label: "4"),
+            binding("FnTwo", keyCode: UInt32(kVK_ANSI_2), modifiers: fnModifierMask, label: "2"),
             binding("Apple", keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | shiftKey), label: "A"),
             binding("Zero", keyCode: UInt32(kVK_ANSI_0), label: "0")
         ]
         let ordered = BindingOrder.sorted(mixed).map(\.target.name)
-        if ordered != ["Zero", "Four", "Nine", "Apple", "Safari", "None"] {
+        if ordered != ["Zero", "Four", "Nine", "FnTwo", "Apple", "Safari", "None"] {
             failures.append("bindings were not sorted command-digits first: \(ordered)")
         }
 
@@ -4599,17 +6144,82 @@ private enum SelfTest {
             }
         }
     }
+
+    private static func checkDiagnosticSummary(_ failures: inout [String]) {
+        let model = QuickToggleModel(diagnosticMode: true)
+        let summary = model.diagnosticSummary
+        if !summary.contains("0 个应用") || !summary.contains("全部停用") {
+            failures.append("runtime diagnostic summary lost binding or registration state")
+        }
+        if !summary.contains("辅助功能") {
+            failures.append("runtime diagnostic summary lost accessibility state")
+        }
+        if !summary.contains("Fn 通道未使用") {
+            failures.append("runtime diagnostic summary lost fn event-tap state")
+        }
+    }
+
+    private static func checkApplicationFiltering(_ failures: inout [String]) {
+        let key = Shortcut(keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(cmdKey), label: "4")
+        let app = AppBinding(id: UUID(), target: TargetApplication(bundleIdentifier: "test.hidden.codex", name: "Visual Editor", path: "/fixture.app"), shortcut: key, launchIfNeeded: true)
+        let pending = AppBinding(id: UUID(), target: TargetApplication(bundleIdentifier: "test.chat", name: "聊天", path: "/fixture.app"), shortcut: nil, launchIfNeeded: true)
+        let occupied = OccupiedHotKeyEntry(name: "系统组合", shortcut: key)
+        let bindings = [app, pending]
+        let cases: [(ApplicationListScope, String, Int)] = [
+            (.all, "", 2), (.all, "  vISual   ⌘4  ", 1), (.all, "聊天", 1),
+            (.all, "codex", 0), (.all, "absent", 0), (.needsShortcut, "", 1),
+            (.needsShortcut, "Editor", 0), (.occupied, "系统", 1), (.occupied, "聊天", 0)
+        ]
+        for (scope, query, expected) in cases {
+            if ApplicationListFilter.rows(bindings: bindings, occupied: [occupied], scope: scope, query: query).count != expected {
+                failures.append("application filter failed: \(scope), \(query)")
+            }
+        }
+        let preview = QuickToggleModel(diagnosticMode: true, previewMode: true, previewBindings: bindings)
+        defer { preview.close() }
+        preview.toggleEnabled()
+        preview.handleHotKey(app.id)
+        preview.recoverHotKeys()
+        if preview.registeredShortcutCount != 0 || preview.shortcutState(for: app).text != "预览" {
+            failures.append("preview acquired live registrations or mislabeled its state")
+        }
+        if preview.shortcutState(for: pending).text != "待设置" {
+            failures.append("pending shortcut lost its state in preview")
+        }
+    }
+
+    static func runInterfaceSmoke() -> Bool {
+        let bindings = (1...20).map { index in
+            AppBinding(id: UUID(), target: TargetApplication(bundleIdentifier: "test.ui.\(index)", name: "应用 \(index) · A long application title", path: "/fixture.app"),
+                       shortcut: nil, launchIfNeeded: true)
+        }
+        let model = QuickToggleModel(diagnosticMode: true, previewMode: true, previewBindings: bindings)
+        defer { model.close() }
+        let controller = SettingsController(model: model)
+        let failures = controller.interfaceLayoutFailures()
+        failures.forEach { print("FAIL: \($0)") }
+        print(failures.isEmpty ? "Interface layout smoke passed (600/760/1080 widths)" : "Interface layout smoke failed")
+        return failures.isEmpty
+    }
 }
 
 private let arguments = Set(CommandLine.arguments.dropFirst())
+if arguments.contains("--ui-smoke-test") {
+    _ = NSApplication.shared
+    exit(SelfTest.runInterfaceSmoke() ? 0 : 1)
+}
 if arguments.contains("--self-test") {
     exit(SelfTest.run() ? 0 : 1)
 }
+if arguments.contains("--smoke-test") {
+    exit(SelfTest.runComponentSmoke() ? 0 : 1)
+}
+if arguments.contains("--idle-measure") {
+    SelfTest.runIdleMeasure()
+    exit(0)
+}
 
-private let launchMode: LaunchMode = arguments.contains("--smoke-test")
-    ? .smoke
-    : (arguments.contains("--idle-measure") ? .idleMeasure : .normal)
 private let application = NSApplication.shared
-private let delegate = AppDelegate(mode: launchMode)
+private let delegate = AppDelegate()
 application.delegate = delegate
 application.run()
