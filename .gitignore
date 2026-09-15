@@ -2,5 +2,12 @@
 build/
 config.json
 QuickToggle.diff
+reviews/
+*.app/
+*.dSYM/
+quicktoggle-backup-*.json
+.env
+.env.*
+!.env.example
 Assets/QuickToggleIcon-v1*
 Assets/QuickToggleIcon-0817v2.iconset/
