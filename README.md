@@ -4,6 +4,8 @@
 
 当前源码版本：`1.0.0`（轻唤 1.0）
 
+Windows 用户可使用 [Windows 1.0 预览版](https://github.com/BLACKIELF/QuickToggle/releases/tag/v1.0.0-windows-preview.1)，提供 x64 与 ARM64 原生托盘程序，详见 [Windows 使用说明](windows/README.md)。下文为 macOS 版说明。
+
 详细说明与示例图见 [`docs/使用说明.md`](docs/使用说明.md)。
 
 ## 1.0 更新
