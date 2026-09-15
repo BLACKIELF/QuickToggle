@@ -9,5 +9,7 @@ quicktoggle-backup-*.json
 .env
 .env.*
 !.env.example
+windows/**/bin/
+windows/**/obj/
 Assets/QuickToggleIcon-v1*
 Assets/QuickToggleIcon-0817v2.iconset/

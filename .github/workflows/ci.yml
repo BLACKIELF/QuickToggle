@@ -53,3 +53,41 @@ jobs:
               assert info["QuickToggleSourceRevision"] == revision
           print(f"Verified QuickToggle {version} release archive")
           PY
+
+  windows:
+    name: Windows ${{ matrix.runtime }} build and checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: win-x64
+            runner: windows-2025
+          - runtime: win-arm64
+            runner: windows-11-vs2026-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: Check source
+        run: git diff --check
+      - name: Build, run native checks and package
+        shell: pwsh
+        run: ./windows/build.ps1 -Runtime ${{ matrix.runtime }} -Package
+      - name: Upload packages and UI checks
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: QuickToggle-${{ matrix.runtime }}
+          path: |
+            build/windows/${{ matrix.runtime }}/*.zip
+            build/windows/${{ matrix.runtime }}/SHA256SUMS-*.txt
+            build/windows/${{ matrix.runtime }}/checks/*.png
+          if-no-files-found: error
+          retention-days: 14
